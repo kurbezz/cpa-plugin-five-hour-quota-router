@@ -384,8 +384,6 @@ func TestMalformedOrMissingUsageIsClassifiedInvalidUsage(t *testing.T) {
 		{name: "null", body: `{"five_hour":{"utilization":null}}`, category: pollErrorInvalidUsage},
 		{name: "negative", body: `{"five_hour":{"utilization":-1}}`, category: pollErrorInvalidUsage},
 		{name: "over one hundred", body: `{"five_hour":{"utilization":101,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidUsage},
-		{name: "missing reset", body: `{"five_hour":{"utilization":50}}`, category: pollErrorInvalidUsage},
-		{name: "null reset", body: `{"five_hour":{"utilization":50,"resets_at":null}}`, category: pollErrorInvalidUsage},
 		{name: "malformed reset", body: `{"five_hour":{"utilization":50,"resets_at":"not-a-time"}}`, category: pollErrorInvalidUsage},
 		{name: "numeric reset", body: `{"five_hour":{"utilization":50,"resets_at":1784937600}}`, category: pollErrorInvalidUsage},
 		{name: "malformed json", body: `{"five_hour":`, category: pollErrorInvalidJSON},
@@ -411,6 +409,57 @@ func TestMalformedOrMissingUsageIsClassifiedInvalidUsage(t *testing.T) {
 	_, decisionError := runtime.pick(claudeRequest(candidate("unknown", 0)))
 	if decisionError == nil || decisionError.Code != exhaustedErrorCode {
 		t.Fatalf("never-sampled auth should be fail-closed and excluded: error = %#v", decisionError)
+	}
+}
+
+// TestNullOrMissingResetsAtIsAValidSampleNotAnError is a regression test for a
+// production incident: Anthropic returns resets_at=null (or omits the field)
+// when a credential has no active five-hour session - most commonly at
+// utilization=0, right after a reset or before first use in the window. This
+// is the healthiest possible account state, not a parse failure. Treating it
+// as pollErrorInvalidUsage meant such a credential could NEVER produce a
+// successful sample, so fail-closed permanently excluded it from scheduling -
+// even though it had zero usage - while traffic kept flowing to a genuinely
+// exhausted sibling credential via the overage fallback. This must not
+// regress: null/missing resets_at is a valid sample with a zero ResetAt.
+func TestNullOrMissingResetsAtIsAValidSampleNotAnError(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "null resets_at at zero utilization", body: `{"five_hour":{"utilization":0,"resets_at":null}}`},
+		{name: "null resets_at at nonzero utilization", body: `{"five_hour":{"utilization":50,"resets_at":null}}`},
+		{name: "missing resets_at key entirely", body: `{"five_hour":{"utilization":0}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
+			result, category := fetcher.fetch(context.Background(), "token", time.Second)
+			if category != "" {
+				t.Fatalf("category = %q, want success (empty)", category)
+			}
+			if !result.ResetAt.IsZero() {
+				t.Fatalf("ResetAt = %v, want zero time for null/missing resets_at", result.ResetAt)
+			}
+		})
+	}
+}
+
+// TestZeroUtilizationWithNullResetIsImmediatelyAvailable is the end-to-end
+// regression test for the same incident at the scheduler level: a credential
+// whose only sample is {utilization: 0, resets_at: null} must be selectable
+// on the very next pick, not fail-closed as unknown.
+func TestZeroUtilizationWithNullResetIsImmediatelyAvailable(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("fresh-account", 0, time.Time{}, now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("fresh-account", 1)))
+	if decisionError != nil || !response.Handled || response.AuthID != "fresh-account" {
+		t.Fatalf("response = %#v, error = %#v, want fresh-account selected", response, decisionError)
 	}
 }
 

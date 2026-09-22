@@ -129,8 +129,16 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 		if !ok {
 			return usageResult{}, pollErrorInvalidUsage
 		}
-		resetAt, ok := parseResetTime(payload.FiveHour.ResetsAt)
-		if !ok {
+		// A null/absent resets_at means the account has no active five-hour
+		// session (most commonly seen at utilization=0, just after a reset or
+		// before first use this window). That is a valid, healthy sample, not
+		// a parse failure: use the zero time.Time{} to mean "no expiry known
+		// yet"; cache.go's known()/excluded() already treat a zero ResetAt as
+		// "rely on the percentage alone", which is exactly correct here.
+		resetAt, hasResetAt := parseResetTime(payload.FiveHour.ResetsAt)
+		if !hasResetAt && !isNullOrEmptyRaw(payload.FiveHour.ResetsAt) {
+			// resets_at was present but malformed (not a valid RFC3339 string
+			// and not null) - that is a genuine parse failure.
 			return usageResult{}, pollErrorInvalidUsage
 		}
 		return usageResult{FiveHourPercentUsed: percentUsed, ResetAt: resetAt}, ""
@@ -144,14 +152,20 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 		if !ok {
 			return usageResult{}, pollErrorInvalidUsage
 		}
-		resetAt, ok := parseResetTime(entry.ResetsAt)
-		if !ok {
+		resetAt, hasResetAt := parseResetTime(entry.ResetsAt)
+		if !hasResetAt && !isNullOrEmptyRaw(entry.ResetsAt) {
 			return usageResult{}, pollErrorInvalidUsage
 		}
 		return usageResult{FiveHourPercentUsed: percentUsed, ResetAt: resetAt}, ""
 	}
 
 	return usageResult{}, pollErrorInvalidUsage
+}
+
+// isNullOrEmptyRaw reports whether raw JSON represents an absent or explicit
+// null value, as opposed to a present-but-malformed one.
+func isNullOrEmptyRaw(raw json.RawMessage) bool {
+	return len(raw) == 0 || string(raw) == "null"
 }
 
 // Anthropic reports percentage points: 1.0 means 1%, not 100%.
