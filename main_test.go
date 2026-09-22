@@ -143,6 +143,12 @@ func candidate(id string, priority int) pluginapi.SchedulerAuthCandidate {
 	return pluginapi.SchedulerAuthCandidate{ID: id, Provider: "claude", Priority: priority}
 }
 
+func weightedCandidate(id string, priority int, weight string) pluginapi.SchedulerAuthCandidate {
+	c := candidate(id, priority)
+	c.Attributes = map[string]string{"weight": weight}
+	return c
+}
+
 func physicalEntry(id, index string) pluginapi.HostAuthFileEntry {
 	return pluginapi.HostAuthFileEntry{
 		ID:        id,
@@ -715,6 +721,96 @@ func TestOverageFallbackNeverInvokedWhenACandidateIsAvailable(t *testing.T) {
 	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
 	if decisionError != nil || !response.Handled || response.AuthID != "B" {
 		t.Fatalf("response = %#v, error = %#v, want normal selection of B despite A's higher priority", response, decisionError)
+	}
+}
+
+// TestNormalSelectionPrefersHigherWeightAmongSamePriorityAvailable verifies
+// that among two AVAILABLE (under-cutoff) candidates tied on priority, the
+// one with the higher host "weight" attribute is selected first for normal
+// (free-quota) traffic, not just for the overage fallback.
+func TestNormalSelectionPrefersHigherWeightAmongSamePriorityAvailable(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("low-weight", 10, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("high-weight", 10, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(
+		weightedCandidate("low-weight", 5, "1"),
+		weightedCandidate("high-weight", 5, "9"),
+	))
+	if decisionError != nil || !response.Handled || response.AuthID != "high-weight" {
+		t.Fatalf("response = %#v, error = %#v, want normal selection to prefer high-weight", response, decisionError)
+	}
+}
+
+// TestNormalSelectionWeightTieBreaksByLowestIDWhenWeightsEqual verifies the
+// full tie-break chain for normal selection: equal priority, equal weight,
+// lowest ID wins - matching the pre-weight behavior exactly when weights tie
+// (including the common case of no weight attribute set on either side).
+func TestNormalSelectionWeightTieBreaksByLowestIDWhenWeightsEqual(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("z-auth", 10, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("a-auth", 10, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("z-auth", 5), candidate("a-auth", 5)))
+	if decisionError != nil || !response.Handled || response.AuthID != "a-auth" {
+		t.Fatalf("response = %#v, error = %#v, want a-auth (lowest ID, weights both default to 1)", response, decisionError)
+	}
+}
+
+// TestOverageFallbackPrefersHigherWeightAmongSamePriorityConfirmedExhausted
+// verifies the same weight-based preference applies to the overage-fallback
+// candidate: once every same-priority candidate is confirmed exhausted, the
+// one with the higher "weight" attribute absorbs the billable traffic.
+func TestOverageFallbackPrefersHigherWeightAmongSamePriorityConfirmedExhausted(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("low-weight", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("high-weight", 96, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(
+		weightedCandidate("low-weight", 5, "1"),
+		weightedCandidate("high-weight", 5, "9"),
+	))
+	if decisionError != nil || !response.Handled || response.AuthID != "high-weight" {
+		t.Fatalf("response = %#v, error = %#v, want overage fallback to prefer high-weight", response, decisionError)
+	}
+}
+
+// TestCandidateWeightDefaultsToOneForMissingOrInvalidValues covers the
+// candidateWeight() helper directly: missing Attributes, missing key, empty
+// string, non-numeric, and negative values must all default to weight 1
+// (not exclude the candidate, not panic, not treat as zero/unset priority).
+func TestCandidateWeightDefaultsToOneForMissingOrInvalidValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate *pluginapi.SchedulerAuthCandidate
+	}{
+		{name: "nil candidate", candidate: nil},
+		{name: "nil attributes", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x"}},
+		{name: "missing key", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{}}},
+		{name: "empty value", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": ""}}},
+		{name: "whitespace value", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": "   "}}},
+		{name: "non-numeric", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": "high"}}},
+		{name: "negative", candidate: &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": "-5"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := candidateWeight(test.candidate); got != 1 {
+				t.Fatalf("candidateWeight() = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestCandidateWeightParsesValidPositiveValue is the positive-path
+// counterpart: a valid non-negative integer weight is parsed as-is.
+func TestCandidateWeightParsesValidPositiveValue(t *testing.T) {
+	c := &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": "42"}}
+	if got := candidateWeight(c); got != 42 {
+		t.Fatalf("candidateWeight() = %d, want 42", got)
+	}
+	zero := &pluginapi.SchedulerAuthCandidate{ID: "x", Attributes: map[string]string{"weight": "0"}}
+	if got := candidateWeight(zero); got != 0 {
+		t.Fatalf("candidateWeight(0) = %d, want 0 (explicit zero is preserved, not defaulted)", got)
 	}
 }
 

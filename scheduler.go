@@ -5,10 +5,35 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+// candidateWeight reads the host's "weight" attribute (sdk/cliproxy/auth
+// AttributeWeight), which CLIProxyAPI's own weighted-round-robin strategy
+// also reads from the same auth JSON field. It is only consulted here as a
+// tie-break for the overage-fallback candidate (which credential absorbs
+// billable Extra Usage once every candidate has confirmed-exhausted its free
+// five-hour quota), never for normal selection among available candidates.
+// Missing, empty, or invalid values default to 1 so operators who never set
+// a weight see no behavior change (every candidate ties at 1, and the
+// existing lowest-ID tie-break still decides).
+func candidateWeight(candidate *pluginapi.SchedulerAuthCandidate) int64 {
+	if candidate == nil || candidate.Attributes == nil {
+		return 1
+	}
+	raw := strings.TrimSpace(candidate.Attributes["weight"])
+	if raw == "" {
+		return 1
+	}
+	weight, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || weight < 0 {
+		return 1
+	}
+	return weight
+}
 
 type physicalClaudeAuth struct {
 	ID        string
@@ -70,6 +95,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			"id":       c.ID,
 			"provider": c.Provider,
 			"priority": c.Priority,
+			"weight":   candidateWeight(c),
 			"status":   c.Status,
 		})
 	}
@@ -94,11 +120,18 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
-		// Track the highest-priority (tie-break: lowest ID) candidate across
-		// ALL claude candidates unconditionally, so it's available for the
-		// overage fallback regardless of which branch executes below.
-		if fallbackCandidate == nil || candidate.Priority > fallbackCandidate.Priority ||
-			(candidate.Priority == fallbackCandidate.Priority && candidate.ID < fallbackCandidate.ID) {
+		// Track the preferred overage-fallback candidate across ALL claude
+		// candidates unconditionally, so it's available regardless of which
+		// branch executes below. Tie-break order: highest Priority first
+		// (matches normal selection and the host's own tiering), then
+		// highest "weight" attribute (lets an operator pick which credential
+		// absorbs billable Extra Usage among same-priority candidates once
+		// every free five-hour quota is confirmed exhausted), then lowest ID
+		// for determinism when priority and weight both tie.
+		if fallbackCandidate == nil ||
+			candidate.Priority > fallbackCandidate.Priority ||
+			(candidate.Priority == fallbackCandidate.Priority && candidateWeight(candidate) > candidateWeight(fallbackCandidate)) ||
+			(candidate.Priority == fallbackCandidate.Priority && candidateWeight(candidate) == candidateWeight(fallbackCandidate) && candidate.ID < fallbackCandidate.ID) {
 			fallbackCandidate = candidate
 		}
 		if r.cache.isExcluded(candidate.ID, now, cfg.CutoffPercentUsed) {
@@ -108,8 +141,14 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			}
 			continue
 		}
-		if selected == nil || candidate.Priority > selected.Priority ||
-			(candidate.Priority == selected.Priority && candidate.ID < selected.ID) {
+		// Same tie-break order as the fallback candidate above: Priority,
+		// then "weight" (so operators can prefer one free/under-cutoff
+		// credential over another same-priority sibling before either one
+		// is ever exhausted), then lowest ID.
+		if selected == nil ||
+			candidate.Priority > selected.Priority ||
+			(candidate.Priority == selected.Priority && candidateWeight(candidate) > candidateWeight(selected)) ||
+			(candidate.Priority == selected.Priority && candidateWeight(candidate) == candidateWeight(selected) && candidate.ID < selected.ID) {
 			selected = candidate
 		}
 	}
