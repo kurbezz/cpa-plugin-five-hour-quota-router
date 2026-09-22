@@ -61,6 +61,8 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	// Diagnostic: log exactly which candidates the host presented for this
 	// pick, so we can tell host-side pre-filtering apart from a scheduler bug.
 	// Safe: only IDs, provider, priority, status - never tokens or auth JSON.
+	// Encoded directly into the message string because the host's text log
+	// sink does not print structured Fields, only Message.
 	candidateSummaries := make([]map[string]any, 0, len(req.Candidates))
 	for i := range req.Candidates {
 		c := &req.Candidates[i]
@@ -71,11 +73,13 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			"status":   c.Status,
 		})
 	}
-	r.log("warn", "five-hour quota router pick candidates snapshot", map[string]any{
+	if snapshotJSON, errMarshal := json.Marshal(map[string]any{
 		"model":           req.Model,
 		"candidate_count": len(req.Candidates),
 		"candidates":      candidateSummaries,
-	})
+	}); errMarshal == nil {
+		r.log("warn", "five-hour quota router pick candidates snapshot "+string(snapshotJSON), nil)
+	}
 	now := r.now()
 	var selected *pluginapi.SchedulerAuthCandidate
 	var fallbackCandidate *pluginapi.SchedulerAuthCandidate
