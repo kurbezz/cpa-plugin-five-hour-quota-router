@@ -27,6 +27,8 @@ const (
 
 var e2eUsageHits atomic.Int64
 
+const e2eProtectedModel = "claude-opus-4-1-20250805"
+
 func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e2eUsageHits.Add(1)
@@ -37,14 +39,14 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 		utilization := 0
 		switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		case "e2e-token-a":
-			utilization = 52
+			utilization = 96
 		case "e2e-token-b":
-			utilization = 80
+			utilization = 99
 		default:
 			http.Error(w, "unknown token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization)
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization)
 	}))
 	defer usageServer.Close()
 
@@ -120,14 +122,14 @@ plugins:
   enabled: true
   dir: %q
   configs:
-    quota-router:
+    five-hour-quota-router:
       enabled: true
       priority: 100
-      protected-models: [claude-fable-5]
-      cutoff-percent-used: 50
+      protected-models: [%s]
+      cutoff-percent-used: 95
       poll-interval: 50ms
       request-timeout: 1s
-`, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir)
+`, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir, e2eProtectedModel)
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +170,7 @@ plugins:
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
 	status := waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != defaultProtectedModel || status.CutoffPercentUsed != 50 || len(status.Accounts) != 2 {
+		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != e2eProtectedModel || status.CutoffPercentUsed != 95 || len(status.Accounts) != 2 {
 			return false
 		}
 		for _, account := range status.Accounts {
@@ -224,7 +226,7 @@ drainProxyHits:
 		return true
 	})
 
-	blockedResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
+	blockedResponse := postClaudeMessage(t, client, baseURL, e2eProtectedModel)
 	if !bytes.Contains(blockedResponse, []byte(exhaustedErrorCode)) {
 		t.Fatalf("protected request did not return cutoff error: %s\nserver log:\n%s", blockedResponse, readLog(logPath))
 	}
@@ -237,7 +239,7 @@ drainProxyHits:
 		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
 	}
 
-	patch := []byte(`{"cutoff-percent-used":90}`)
+	patch := []byte(`{"cutoff-percent-used":100}`)
 	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +256,7 @@ drainProxyHits:
 	}
 
 	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if status.CutoffPercentUsed != 90 || len(status.Accounts) != 2 {
+		if status.CutoffPercentUsed != 100 || len(status.Accounts) != 2 {
 			return false
 		}
 		for _, account := range status.Accounts {
@@ -265,7 +267,7 @@ drainProxyHits:
 		return true
 	})
 
-	eligibleResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
+	eligibleResponse := postClaudeMessage(t, client, baseURL, e2eProtectedModel)
 	if bytes.Contains(eligibleResponse, []byte(exhaustedErrorCode)) {
 		t.Fatalf("eligible request remained cutoff-blocked: %s", eligibleResponse)
 	}

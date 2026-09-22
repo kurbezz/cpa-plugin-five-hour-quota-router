@@ -124,8 +124,10 @@ func newTestRuntime(host hostClient, fetch usageFetcher, now time.Time) *pluginR
 	return newPluginRuntime(host, fetch, func() time.Time { return now })
 }
 
+const testModel = "claude-opus-4-1"
+
 func claudeRequest(candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickRequest {
-	return claudeModelRequest(defaultProtectedModel, candidates...)
+	return claudeModelRequest(testModel, candidates...)
 }
 
 func claudeModelRequest(model string, candidates ...pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickRequest {
@@ -181,12 +183,12 @@ func waitFor(t *testing.T, condition func() bool) {
 func TestCurrentCutoffIsDerivedFromConfig(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	runtime.cache.recordSuccess("auth-a", 55, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 	if _, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0))); decisionError == nil {
-		t.Fatal("55% sample should be blocked at the default cutoff")
+		t.Fatal("96% sample should be excluded at the default cutoff")
 	}
 	cfg := defaultPluginConfig()
-	cfg.CutoffPercentUsed = 60
+	cfg.CutoffPercentUsed = 97
 	runtime.config.Store(&cfg)
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
 	if decisionError != nil || response.AuthID != "auth-a" {
@@ -208,30 +210,49 @@ func TestDisabledConfigLeavesSchedulerUnhandled(t *testing.T) {
 func TestSchedulerOnlyHandlesProtectedModels(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	runtime.cache.recordSuccess("auth-a", 80, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 
-	for _, model := range []string{defaultProtectedModel, " CLAUDE-FABLE-5 "} {
+	// Default config has an empty protected-models list, meaning ALL Claude
+	// models are protected.
+	for _, model := range []string{testModel, " CLAUDE-HAIKU-4-5 ", "any-model-name"} {
 		response, decisionError := runtime.pick(claudeModelRequest(model, candidate("auth-a", 0)))
 		if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
 			t.Fatalf("protected model %q: response=%#v error=%#v", model, response, decisionError)
 		}
 	}
 
-	response, decisionError := runtime.pick(claudeModelRequest("claude-haiku-4-5-20251001", candidate("auth-a", 0)))
-	if decisionError != nil || response.Handled {
-		t.Fatalf("unprotected model: response=%#v error=%#v", response, decisionError)
-	}
-
 	cfg := defaultPluginConfig()
 	cfg.ProtectedModels = []string{"claude-sonnet-4-6"}
 	runtime.config.Store(&cfg)
-	response, decisionError = runtime.pick(claudeModelRequest(defaultProtectedModel, candidate("auth-a", 0)))
+	response, decisionError := runtime.pick(claudeModelRequest(testModel, candidate("auth-a", 0)))
 	if decisionError != nil || response.Handled {
 		t.Fatalf("removed protected model: response=%#v error=%#v", response, decisionError)
 	}
 	response, decisionError = runtime.pick(claudeModelRequest("claude-sonnet-4-6", candidate("auth-a", 0)))
 	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
 		t.Fatalf("configured protected model: response=%#v error=%#v", response, decisionError)
+	}
+}
+
+func TestIsProtectedModelEmptyListMatchesAll(t *testing.T) {
+	if !isProtectedModel("claude-opus-4-1", nil) {
+		t.Fatal("empty protected-models should match any non-empty model")
+	}
+	if !isProtectedModel("any-model-name", []string{}) {
+		t.Fatal("empty protected-models should match any non-empty model")
+	}
+	if isProtectedModel("", nil) {
+		t.Fatal("empty model name should never match")
+	}
+}
+
+func TestIsProtectedModelExplicitListIsExact(t *testing.T) {
+	models := []string{"claude-opus-4-1"}
+	if !isProtectedModel("Claude-Opus-4-1", models) {
+		t.Fatal("explicit list should match case-insensitively")
+	}
+	if isProtectedModel("claude-sonnet-4-6", models) {
+		t.Fatal("explicit list should not match unrelated models")
 	}
 }
 
@@ -250,7 +271,7 @@ func TestDisableClearsCachedQuota(t *testing.T) {
 func TestWhitespaceAuthIDIsIgnored(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	runtime.cache.recordSuccess("auth-a", 80, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(
 		candidate("auth-a", 0),
 		candidate(" auth-a ", 100),
@@ -268,9 +289,10 @@ func TestCutoffBoundary(t *testing.T) {
 		wantAuth  string
 		wantError bool
 	}{
-		{name: "49.9 remains eligible", percent: 49.9, wantAuth: "auth-a"},
-		{name: "exactly 50 is blocked", percent: 50, wantError: true},
-		{name: "above 50 is blocked", percent: 75, wantError: true},
+		{name: "94.9 remains eligible", percent: 94.9, wantAuth: "auth-a"},
+		{name: "0 remains eligible", percent: 0, wantAuth: "auth-a"},
+		{name: "exactly 95 is excluded", percent: 95, wantError: true},
+		{name: "above 95 is excluded", percent: 99, wantError: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -295,9 +317,9 @@ func TestCutoffBoundary(t *testing.T) {
 
 func TestActualEndpointUtilizationScaleIsPercentPoints(t *testing.T) {
 	value := 0.5
-	got, ok := normalizeWeeklyPercent(&value)
+	got, ok := normalizeUtilization(&value)
 	if !ok || got != 0.5 {
-		t.Fatalf("normalizeWeeklyPercent(0.5) = %v, %v; want 0.5, true", got, ok)
+		t.Fatalf("normalizeUtilization(0.5) = %v, %v; want 0.5, true", got, ok)
 	}
 
 	headerError := make(chan string, 1)
@@ -310,11 +332,11 @@ func TestActualEndpointUtilizationScaleIsPercentPoints(t *testing.T) {
 			headerError <- "missing anthropic beta header"
 			return
 		}
-		_, _ = w.Write([]byte(`{"seven_day":{"utilization":9.0,"resets_at":"2026-07-25T00:00:00Z"}}`))
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":9.0,"resets_at":"2026-07-25T00:00:00Z"}}`))
 	}))
 	defer server.Close()
 
-	fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+	fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 	result, category := fetcher.fetch(context.Background(), "fixture-token", time.Second)
 	select {
 	case message := <-headerError:
@@ -324,29 +346,29 @@ func TestActualEndpointUtilizationScaleIsPercentPoints(t *testing.T) {
 	if category != "" {
 		t.Fatalf("fetch category = %q", category)
 	}
-	if result.WeeklyPercentUsed != 9.0 {
-		t.Fatalf("weekly percent = %v, want 9", result.WeeklyPercentUsed)
+	if result.FiveHourPercentUsed != 9.0 {
+		t.Fatalf("weekly percent = %v, want 9", result.FiveHourPercentUsed)
 	}
 	if result.ResetAt.Format(time.RFC3339) != "2026-07-25T00:00:00Z" {
 		t.Fatalf("reset = %s", result.ResetAt)
 	}
 }
 
-func TestMalformedOrMissingWeeklyQuotaFailsOpen(t *testing.T) {
+func TestMalformedOrMissingUsageIsClassifiedInvalidUsage(t *testing.T) {
 	tests := []struct {
 		name     string
 		body     string
 		category string
 	}{
-		{name: "missing", body: `{}`, category: pollErrorInvalidWeekly},
-		{name: "null", body: `{"seven_day":{"utilization":null}}`, category: pollErrorInvalidWeekly},
-		{name: "negative", body: `{"seven_day":{"utilization":-1}}`, category: pollErrorInvalidWeekly},
-		{name: "over one hundred", body: `{"seven_day":{"utilization":101,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidWeekly},
-		{name: "missing reset", body: `{"seven_day":{"utilization":50}}`, category: pollErrorInvalidWeekly},
-		{name: "null reset", body: `{"seven_day":{"utilization":50,"resets_at":null}}`, category: pollErrorInvalidWeekly},
-		{name: "malformed reset", body: `{"seven_day":{"utilization":50,"resets_at":"not-a-time"}}`, category: pollErrorInvalidWeekly},
-		{name: "numeric reset", body: `{"seven_day":{"utilization":50,"resets_at":1784937600}}`, category: pollErrorInvalidWeekly},
-		{name: "malformed json", body: `{"seven_day":`, category: pollErrorInvalidJSON},
+		{name: "missing", body: `{}`, category: pollErrorInvalidUsage},
+		{name: "null", body: `{"five_hour":{"utilization":null}}`, category: pollErrorInvalidUsage},
+		{name: "negative", body: `{"five_hour":{"utilization":-1}}`, category: pollErrorInvalidUsage},
+		{name: "over one hundred", body: `{"five_hour":{"utilization":101,"resets_at":"2026-07-25T00:00:00Z"}}`, category: pollErrorInvalidUsage},
+		{name: "missing reset", body: `{"five_hour":{"utilization":50}}`, category: pollErrorInvalidUsage},
+		{name: "null reset", body: `{"five_hour":{"utilization":50,"resets_at":null}}`, category: pollErrorInvalidUsage},
+		{name: "malformed reset", body: `{"five_hour":{"utilization":50,"resets_at":"not-a-time"}}`, category: pollErrorInvalidUsage},
+		{name: "numeric reset", body: `{"five_hour":{"utilization":50,"resets_at":1784937600}}`, category: pollErrorInvalidUsage},
+		{name: "malformed json", body: `{"five_hour":`, category: pollErrorInvalidJSON},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -354,7 +376,7 @@ func TestMalformedOrMissingWeeklyQuotaFailsOpen(t *testing.T) {
 				_, _ = w.Write([]byte(test.body))
 			}))
 			defer server.Close()
-			fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+			fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 			_, category := fetcher.fetch(context.Background(), "token", time.Second)
 			if category != test.category {
 				t.Fatalf("category = %q, want %q", category, test.category)
@@ -362,11 +384,13 @@ func TestMalformedOrMissingWeeklyQuotaFailsOpen(t *testing.T) {
 		})
 	}
 
+	// A never-sampled credential is fail-closed: it is excluded from scheduling
+	// until at least one successful poll has happened.
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	response, decisionError := runtime.pick(claudeRequest(candidate("unknown", 0)))
-	if decisionError != nil || !response.Handled || response.AuthID != "unknown" {
-		t.Fatalf("unknown sample response = %#v, error = %#v", response, decisionError)
+	_, decisionError := runtime.pick(claudeRequest(candidate("unknown", 0)))
+	if decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("never-sampled auth should be fail-closed and excluded: error = %#v", decisionError)
 	}
 }
 
@@ -388,7 +412,7 @@ func TestHTTPFailuresAreBoundedAndClassified(t *testing.T) {
 				_, _ = w.Write([]byte("complete-upstream-body-must-not-escape"))
 			}))
 			defer server.Close()
-			fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+			fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 			_, category := fetcher.fetch(context.Background(), "secret-token", time.Second)
 			if category != test.category {
 				t.Fatalf("category = %q, want %q", category, test.category)
@@ -400,7 +424,7 @@ func TestHTTPFailuresAreBoundedAndClassified(t *testing.T) {
 		_, _ = w.Write([]byte(strings.Repeat("x", maxUsageResponseBytes+1)))
 	}))
 	defer server.Close()
-	fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+	fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 	_, category := fetcher.fetch(context.Background(), "secret-token", time.Second)
 	if category != pollErrorBodyTooLarge {
 		t.Fatalf("oversized category = %q, want %q", category, pollErrorBodyTooLarge)
@@ -408,10 +432,10 @@ func TestHTTPFailuresAreBoundedAndClassified(t *testing.T) {
 
 	timeoutServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(100 * time.Millisecond)
-		_, _ = w.Write([]byte(`{"seven_day":{"utilization":1}}`))
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":1}}`))
 	}))
 	defer timeoutServer.Close()
-	timeoutFetcher := newHTTPUsageFetcher(timeoutServer.URL, timeoutServer.Client().Transport)
+	timeoutFetcher := newHTTPUsageFetcher(timeoutServer.URL, timeoutServer.Client().Transport, "")
 	started := time.Now()
 	_, category = timeoutFetcher.fetch(context.Background(), "secret-token", 10*time.Millisecond)
 	if category != pollErrorTimeout {
@@ -437,7 +461,7 @@ func TestBodyReadCancellationIsClassified(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan string, 1)
 	go func() {
-		fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+		fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 		_, category := fetcher.fetch(ctx, "secret-token", time.Second)
 		result <- category
 	}()
@@ -466,7 +490,7 @@ func TestHTTPRedirectIsNotFollowed(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	fetcher := newHTTPUsageFetcher(redirect.URL, redirect.Client().Transport)
+	fetcher := newHTTPUsageFetcher(redirect.URL, redirect.Client().Transport, "")
 	if _, category := fetcher.fetch(context.Background(), "secret-token", time.Second); category != pollErrorHTTP {
 		t.Fatalf("redirect category = %q, want %q", category, pollErrorHTTP)
 	}
@@ -487,11 +511,11 @@ func TestNonClaudeRequestsAreUnhandled(t *testing.T) {
 	}
 }
 
-func TestClaudeSelectionIgnoresBlockedCandidates(t *testing.T) {
+func TestClaudeSelectionIgnoresExcludedCandidates(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	runtime.cache.recordSuccess("blocked-high", 50, now.Add(time.Hour), now)
-	runtime.cache.recordSuccess("eligible-low", 49.9, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("blocked-high", 95, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("eligible-low", 94.9, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(
 		candidate("blocked-high", 100),
 		candidate("eligible-low", 1),
@@ -501,8 +525,39 @@ func TestClaudeSelectionIgnoresBlockedCandidates(t *testing.T) {
 	}
 }
 
+// TestTwoCandidatesOneExcludedOnePicksAvailable exercises isExcluded-based
+// candidate filtering directly: A is over cutoff and not yet reset, B is
+// available, scheduler must pick B.
+func TestTwoCandidatesOneExcludedOnePicksAvailable(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("B", 10, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if decisionError != nil || response.AuthID != "B" {
+		t.Fatalf("response = %#v, error = %#v, want B", response, decisionError)
+	}
+}
+
+// TestBothCandidatesExcludedReturnsExhaustedError exercises the all-excluded
+// path returning the exhausted error code.
+func TestBothCandidatesExcludedReturnsExhaustedError(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("B", 96, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("response = %#v, error = %#v, want exhausted", response, decisionError)
+	}
+}
+
 func TestHighestPriorityEligibleCandidateWins(t *testing.T) {
-	runtime := newTestRuntime(&fakeHost{}, nil, time.Now())
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	for _, id := range []string{"low", "high", "middle"} {
+		runtime.cache.recordSuccess(id, 1, now.Add(time.Hour), now)
+	}
 	response, decisionError := runtime.pick(claudeRequest(
 		candidate("low", 1),
 		candidate("high", 20),
@@ -514,7 +569,11 @@ func TestHighestPriorityEligibleCandidateWins(t *testing.T) {
 }
 
 func TestEqualPriorityUsesLexicalAuthID(t *testing.T) {
-	runtime := newTestRuntime(&fakeHost{}, nil, time.Now())
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	for _, id := range []string{"z-auth", "a-auth", "m-auth"} {
+		runtime.cache.recordSuccess(id, 1, now.Add(time.Hour), now)
+	}
 	response, decisionError := runtime.pick(claudeRequest(
 		candidate("z-auth", 10),
 		candidate("a-auth", 10),
@@ -529,6 +588,7 @@ func TestSchedulerRespectsRequestCandidateList(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.recordSuccess("not-supplied", 1, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("supplied", 1, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("supplied", 1)))
 	if decisionError != nil || response.AuthID != "supplied" {
 		t.Fatalf("response = %#v, error = %#v", response, decisionError)
@@ -538,19 +598,24 @@ func TestSchedulerRespectsRequestCandidateList(t *testing.T) {
 func TestAllClaudeCandidatesBlockedReturnsExplicitError(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
-	runtime.cache.recordSuccess("auth-a", 50, now.Add(time.Hour), now)
-	runtime.cache.recordSuccess("auth-b", 80, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-b", 99, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0), candidate("auth-b", 0)))
 	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != exhaustedErrorCode {
 		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 }
 
-func TestUnknownSampleFailsOpen(t *testing.T) {
+func TestUnknownSampleFailsClosed(t *testing.T) {
+	// A credential with zero successful samples ever is fail-closed: excluded
+	// from scheduling until a poll succeeds.
 	runtime := newTestRuntime(&fakeHost{}, nil, time.Now())
 	response, decisionError := runtime.pick(claudeRequest(candidate("unknown", 0)))
-	if decisionError != nil || response.AuthID != "unknown" || !response.Handled {
-		t.Fatalf("response = %#v, error = %#v", response, decisionError)
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("response = %#v, error = %#v, want fail-closed exclusion", response, decisionError)
+	}
+	if !runtime.cache.isExcluded("unknown", time.Now(), defaultCutoffPercentUsed) {
+		t.Fatal("never-sampled credential should be isExcluded")
 	}
 }
 
@@ -564,15 +629,45 @@ func TestPollingFailureRetainsKnownBlockedState(t *testing.T) {
 		"token-a": {{category: pollErrorRateLimited}},
 	}}
 	runtime := newTestRuntime(host, fetcher.fetch, now)
-	runtime.cache.recordSuccess("auth-a", 50, now.Add(time.Hour), now.Add(-time.Minute))
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now.Add(-time.Minute))
 	runtime.pollOnce(context.Background(), defaultPluginConfig())
 
 	sample := runtime.cache.snapshot("auth-a")
-	if !sample.HasSample || !sample.blocked(now, 50) || sample.WeeklyPercentUsed != 50 || sample.LastErrorCategory != pollErrorRateLimited {
+	if !sample.HasSample || !sample.blocked(now, 95) || sample.FiveHourPercentUsed != 96 || sample.LastErrorCategory != pollErrorRateLimited {
 		t.Fatalf("sample = %#v", sample)
 	}
-	if !runtime.cache.isBlocked("auth-a", now, 50) {
+	if !runtime.cache.isBlocked("auth-a", now, 95) {
 		t.Fatal("blocked state was cleared by polling failure")
+	}
+	if !runtime.cache.isExcluded("auth-a", now, 95) {
+		t.Fatal("excluded state was cleared by polling failure")
+	}
+}
+
+// TestFailureDoesNotOverwritePriorSuccessfulSample verifies recordFailure
+// never touches HasSample/FiveHourPercentUsed/ResetAt for a credential that
+// already had a successful sample within its reset window.
+func TestFailureDoesNotOverwritePriorSuccessfulSample(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	resetAt := now.Add(time.Hour)
+	runtime.cache.recordSuccess("auth-a", 40, resetAt, now)
+	before := runtime.cache.snapshot("auth-a")
+
+	for _, category := range []string{pollErrorUnauthorized, pollErrorRateLimited, pollErrorTimeout} {
+		runtime.cache.recordFailure("auth-a", category)
+		after := runtime.cache.snapshot("auth-a")
+		if after.HasSample != before.HasSample || after.FiveHourPercentUsed != before.FiveHourPercentUsed || !after.ResetAt.Equal(before.ResetAt) {
+			t.Fatalf("recordFailure(%q) mutated sample data: before=%#v after=%#v", category, before, after)
+		}
+		if after.LastErrorCategory != category {
+			t.Fatalf("recordFailure(%q) did not record category: %#v", category, after)
+		}
+	}
+	// The credential remains selectable since it's still within its reset window and below cutoff.
+	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
+	if decisionError != nil || response.AuthID != "auth-a" {
+		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 }
 
@@ -583,14 +678,14 @@ func TestSuccessfulBelowCutoffRefreshClearsBlockedState(t *testing.T) {
 		authJSON: map[string]json.RawMessage{"index-a": credentialJSON("token-a")},
 	}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
-		"token-a": {{result: usageResult{WeeklyPercentUsed: 49.9, ResetAt: now.Add(time.Hour)}}},
+		"token-a": {{result: usageResult{FiveHourPercentUsed: 49.9, ResetAt: now.Add(time.Hour)}}},
 	}}
 	runtime := newTestRuntime(host, fetcher.fetch, now)
 	runtime.cache.recordSuccess("auth-a", 80, now.Add(time.Hour), now.Add(-time.Minute))
 	runtime.pollOnce(context.Background(), defaultPluginConfig())
 
 	sample := runtime.cache.snapshot("auth-a")
-	if !sample.HasSample || sample.blocked(now, 50) || sample.WeeklyPercentUsed != 49.9 || sample.LastErrorCategory != "" {
+	if !sample.HasSample || sample.blocked(now, 95) || sample.FiveHourPercentUsed != 49.9 || sample.LastErrorCategory != "" {
 		t.Fatalf("sample = %#v", sample)
 	}
 }
@@ -604,8 +699,26 @@ func TestExpiredResetClearsStaleBlockedSample(t *testing.T) {
 		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 	sample := runtime.cache.snapshot("auth-a")
-	if sample.known(now) || sample.blocked(now, 50) {
+	if sample.known(now) || sample.blocked(now, 95) {
 		t.Fatalf("expired sample = %#v, want fail-open state", sample)
+	}
+}
+
+// TestExpiredResetOverridesStaleOverCutoffPercent proves the excluded()
+// reset-passed branch takes priority even when the stale cached percent was
+// above cutoff: once resets_at has passed, the credential must be available
+// again regardless of the stale percent value.
+func TestExpiredResetOverridesStaleOverCutoffPercent(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	// 99% stale usage, but reset time is already in the past.
+	runtime.cache.recordSuccess("auth-a", 99, now.Add(-time.Second), now.Add(-time.Hour))
+	if runtime.cache.isExcluded("auth-a", now, 95) {
+		t.Fatal("credential with expired reset should not be excluded, regardless of stale over-cutoff percent")
+	}
+	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
+	if decisionError != nil || response.AuthID != "auth-a" {
+		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 }
 
@@ -620,7 +733,7 @@ func TestOneFailedAccountDoesNotStopRefreshPass(t *testing.T) {
 		getErrors: map[string]error{"index-a": errors.New("fixture read failure")},
 	}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
-		"token-b": {{result: usageResult{WeeklyPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+		"token-b": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
 	}}
 	runtime := newTestRuntime(host, fetcher.fetch, now)
 	runtime.pollOnce(context.Background(), defaultPluginConfig())
@@ -722,7 +835,7 @@ func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 				return usageResult{}, pollErrorCancelled
 			}
 		}
-		return usageResult{WeeklyPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
+		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
 	}
 	runtime := newTestRuntime(host, fetch, now)
 	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{oldEntry}))
@@ -737,9 +850,14 @@ func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first credential was not polled")
 	}
-	response, decisionError := runtime.pick(claudeRequest(candidate("auth-b", 0)))
-	if decisionError != nil || !response.Handled || response.AuthID != "auth-b" {
-		t.Fatalf("replacement remained stale during refresh: response=%#v error=%#v", response, decisionError)
+	// Credential replacement is detected on reconcile (identity changed via
+	// ModTime), which clears the stale sample before the fresh poll for
+	// auth-b runs. Under fail-closed semantics, that means auth-b is
+	// excluded from scheduling until its own poll completes, even though
+	// auth-a's slower poll is still in flight.
+	_, decisionError := runtime.pick(claudeRequest(candidate("auth-b", 0)))
+	if decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("replaced credential should be fail-closed pending its own refresh: error=%#v", decisionError)
 	}
 	releasePoll()
 	select {
@@ -843,10 +961,10 @@ func TestStaleRequestRefreshesOnlySelectedAuth(t *testing.T) {
 		},
 	}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
-		"token-a": {{result: usageResult{WeeklyPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}}},
+		"token-a": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}}},
 		"token-b": {
-			{result: usageResult{WeeklyPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}},
-			{result: usageResult{WeeklyPercentUsed: 80, ResetAt: startedAt.Add(time.Hour)}},
+			{result: usageResult{FiveHourPercentUsed: 10, ResetAt: startedAt.Add(time.Hour)}},
+			{result: usageResult{FiveHourPercentUsed: 96, ResetAt: startedAt.Add(time.Hour)}},
 		},
 	}}
 	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
@@ -879,8 +997,8 @@ func TestBlockedAuthSleepsUntilReset(t *testing.T) {
 	}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
 		"token-a": {
-			{result: usageResult{WeeklyPercentUsed: 80, ResetAt: startedAt.Add(time.Hour)}},
-			{result: usageResult{WeeklyPercentUsed: 5, ResetAt: startedAt.Add(8 * 24 * time.Hour)}},
+			{result: usageResult{FiveHourPercentUsed: 96, ResetAt: startedAt.Add(time.Hour)}},
+			{result: usageResult{FiveHourPercentUsed: 5, ResetAt: startedAt.Add(8 * 24 * time.Hour)}},
 		},
 	}}
 	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
@@ -923,7 +1041,7 @@ func TestDisableClearsInflightSuccess(t *testing.T) {
 	fetch := func(context.Context, string, time.Duration) (usageResult, string) {
 		close(started)
 		<-release
-		return usageResult{WeeklyPercentUsed: 80, ResetAt: now.Add(time.Hour)}, ""
+		return usageResult{FiveHourPercentUsed: 80, ResetAt: now.Add(time.Hour)}, ""
 	}
 	runtime := newPluginRuntime(host, fetch, func() time.Time { return now })
 	cfg := defaultPluginConfig()
@@ -967,7 +1085,7 @@ func TestTokensAndResponseBodiesDoNotAppearInLogsOrErrors(t *testing.T) {
 		entries:  []pluginapi.HostAuthFileEntry{physicalEntry("auth-a", "index-a")},
 		authJSON: map[string]json.RawMessage{"index-a": credentialJSON(token)},
 	}
-	httpFetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport)
+	httpFetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
 	runtime := newTestRuntime(host, httpFetcher.fetch, now)
 	runtime.pollOnce(context.Background(), defaultPluginConfig())
 
@@ -1004,7 +1122,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 		{ID: "auth-a", AuthIndex: "index-a", Name: "claude-a.json"},
 		{ID: "auth-b", AuthIndex: "index-b", Name: "claude-b.json"},
 	})
-	runtime.cache.recordSuccess("auth-a", 50, now.Add(2*time.Hour), now)
+	runtime.cache.recordSuccess("auth-a", 96, now.Add(2*time.Hour), now)
 	runtime.cache.recordFailure("auth-b", pollErrorRateLimited)
 
 	response := runtime.handleManagement(pluginapi.ManagementRequest{
@@ -1018,15 +1136,16 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	if err := json.Unmarshal(response.Body, &status); err != nil {
 		t.Fatal(err)
 	}
-	if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != defaultProtectedModel || status.CutoffPercentUsed != 50 || len(status.Accounts) != 2 {
+	if !status.Enabled || len(status.ProtectedModels) != 0 || status.CutoffPercentUsed != defaultCutoffPercentUsed || len(status.Accounts) != 2 {
 		t.Fatalf("status = %#v", status)
 	}
 	blocked := status.Accounts[0]
-	if blocked.ID != "auth-a" || blocked.AuthIndex != "index-a" || blocked.Name != "claude-a.json" || !blocked.Known || !blocked.Blocked || blocked.WeeklyPercentUsed == nil || *blocked.WeeklyPercentUsed != 50 || blocked.SampledAt == "" || blocked.ResetAt == "" {
+	if blocked.ID != "auth-a" || blocked.AuthIndex != "index-a" || blocked.Name != "claude-a.json" || !blocked.Known || !blocked.Blocked || blocked.FiveHourPercentUsed == nil || *blocked.FiveHourPercentUsed != 96 || blocked.SampledAt == "" || blocked.ResetAt == "" {
 		t.Fatalf("blocked account = %#v", blocked)
 	}
 	unknown := status.Accounts[1]
-	if unknown.ID != "auth-b" || unknown.Known || unknown.Blocked || unknown.WeeklyPercentUsed != nil || unknown.LastErrorCategory != pollErrorRateLimited {
+	// Never-sampled credential: fail-closed, so Blocked (excluded) is true.
+	if unknown.ID != "auth-b" || unknown.Known || !unknown.Blocked || unknown.FiveHourPercentUsed != nil || unknown.LastErrorCategory != pollErrorRateLimited {
 		t.Fatalf("unknown account = %#v", unknown)
 	}
 
@@ -1040,7 +1159,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	}
 	allowedKeys := map[string]bool{
 		"id": true, "auth_index": true, "name": true, "known": true, "blocked": true,
-		"weekly_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
+		"five_hour_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
 	}
 	for _, rawAccount := range rawAccounts {
 		account, okAccount := rawAccount.(map[string]any)
@@ -1072,7 +1191,7 @@ func TestManagementStatusExpiresStaleBlockedSample(t *testing.T) {
 	if err := json.Unmarshal(response.Body, &status); err != nil {
 		t.Fatal(err)
 	}
-	if len(status.Accounts) != 1 || status.Accounts[0].Known || status.Accounts[0].Blocked || status.Accounts[0].WeeklyPercentUsed != nil || status.Accounts[0].LastErrorCategory != pollErrorRateLimited {
+	if len(status.Accounts) != 1 || status.Accounts[0].Known || status.Accounts[0].Blocked || status.Accounts[0].FiveHourPercentUsed != nil || status.Accounts[0].LastErrorCategory != pollErrorRateLimited {
 		t.Fatalf("expired status = %#v", status)
 	}
 	if sample := runtime.cache.snapshot("auth-a"); sample.known(now) || sample.blocked(now, 50) {
@@ -1091,7 +1210,7 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	enabled := true
 	cutoff := 42.5
 	raw, errMarshal := json.Marshal(lifecycleRequest{ConfigYAML: []byte(
-		"enabled: true\nprotected-models: [claude-sonnet-4-6, CLAUDE-FABLE-5, claude-sonnet-4-6]\ncutoff-percent-used: 42.5\npoll-interval: 30s\nrequest-timeout: 2s\n",
+		"enabled: true\nprotected-models: [claude-sonnet-4-6, CLAUDE-OPUS-4-1, claude-sonnet-4-6]\ncutoff-percent-used: 42.5\npoll-interval: 30s\nrequest-timeout: 2s\nuser-agent: custom-agent/1.0\n",
 	)})
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
@@ -1100,16 +1219,21 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	if errConfig != nil {
 		t.Fatal(errConfig)
 	}
-	if cfg.Enabled != enabled || strings.Join(cfg.ProtectedModels, ",") != "claude-fable-5,claude-sonnet-4-6" || cfg.CutoffPercentUsed != cutoff || cfg.PollInterval != 30*time.Second || cfg.RequestTimeout != 2*time.Second {
+	if cfg.Enabled != enabled || strings.Join(cfg.ProtectedModels, ",") != "claude-opus-4-1,claude-sonnet-4-6" || cfg.CutoffPercentUsed != cutoff || cfg.PollInterval != 30*time.Second || cfg.RequestTimeout != 2*time.Second || cfg.UserAgent != "custom-agent/1.0" {
 		t.Fatalf("config = %#v", cfg)
 	}
 	defaults, errDefaults := decodeLifecycleConfig([]byte("{}"))
-	if errDefaults != nil || len(defaults.ProtectedModels) != 1 || defaults.ProtectedModels[0] != defaultProtectedModel {
+	if errDefaults != nil || len(defaults.ProtectedModels) != 0 || defaults.CutoffPercentUsed != defaultCutoffPercentUsed || defaults.PollInterval != defaultPollInterval || defaults.UserAgent != defaultAnthropicUserAgent {
 		t.Fatalf("default config = %#v, error = %v", defaults, errDefaults)
 	}
 
+	// Empty protected-models is now valid (means "protect all").
+	emptyList, errEmpty := decodeLifecycleConfig(mustMarshalLifecycle("protected-models: []\n"))
+	if errEmpty != nil || len(emptyList.ProtectedModels) != 0 {
+		t.Fatalf("empty protected-models = %#v, error = %v", emptyList, errEmpty)
+	}
+
 	for _, configYAML := range []string{
-		"protected-models: []\n",
 		"protected-models: ['']\n",
 		"cutoff-percent-used: 101\n",
 		"cutoff-percent-used: -1\n",
@@ -1125,8 +1249,8 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	registration := pluginRegistration()
 	if registration.Metadata.Name != pluginName ||
 		registration.Metadata.Version != pluginVersion ||
-		registration.Metadata.Author != "Smarty Pants Inc" ||
-		registration.Metadata.GitHubRepository != "https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router" ||
+		registration.Metadata.Author != "kurbezz (fork of Smarty Pants Inc cpa-plugin-quota-router v0.5.0)" ||
+		registration.Metadata.GitHubRepository != "https://github.com/kurbezz/five-hour-quota-router" ||
 		!registration.Capabilities.Scheduler || !registration.Capabilities.ManagementAPI {
 		t.Fatalf("registration = %#v", registration)
 	}
@@ -1137,7 +1261,76 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	if fields["protected-models"] != pluginapi.ConfigFieldTypeArray ||
 		fields["cutoff-percent-used"] != pluginapi.ConfigFieldTypeNumber ||
 		fields["poll-interval"] != pluginapi.ConfigFieldTypeString ||
-		fields["request-timeout"] != pluginapi.ConfigFieldTypeString {
+		fields["request-timeout"] != pluginapi.ConfigFieldTypeString ||
+		fields["user-agent"] != pluginapi.ConfigFieldTypeString {
 		t.Fatalf("config fields = %#v", fields)
+	}
+}
+
+func mustMarshalLifecycle(configYAML string) []byte {
+	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(configYAML)})
+	return raw
+}
+
+// TestFiveHourLimitsFallbackShape verifies the "limits[]" fallback shape
+// (five_hour: null, limits: [{"kind":"session","percent":X,"resets_at":Y}])
+// parses into the same usageResult.FiveHourPercentUsed field.
+func TestFiveHourLimitsFallbackShape(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":null,"limits":[{"kind":"other","percent":10,"resets_at":"2026-01-01T00:00:00Z"},{"kind":"session","percent":33,"resets_at":"2026-02-06T22:00:00+00:00"}]}`))
+	}))
+	defer server.Close()
+	fetcher := newHTTPUsageFetcher(server.URL, server.Client().Transport, "")
+	result, category := fetcher.fetch(context.Background(), "token", time.Second)
+	if category != "" {
+		t.Fatalf("category = %q, want empty", category)
+	}
+	if result.FiveHourPercentUsed != 33 {
+		t.Fatalf("FiveHourPercentUsed = %v, want 33", result.FiveHourPercentUsed)
+	}
+	if result.ResetAt.Format(time.RFC3339) != "2026-02-06T22:00:00Z" {
+		t.Fatalf("reset = %s", result.ResetAt)
+	}
+}
+
+// TestConcurrentPickAndRecordDoesNotRace exercises concurrent pick() calls
+// alongside concurrent recordSuccess/recordFailure writes to the same
+// authID. Run with -race to detect data races.
+func TestConcurrentPickAndRecordDoesNotRace(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("auth-a", 10, now.Add(time.Hour), now)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			runtime.pick(claudeRequest(candidate("auth-a", 0)))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			runtime.cache.recordSuccess("auth-a", float64(i%100), now.Add(time.Hour), now)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			runtime.cache.recordFailure("auth-a", pollErrorRateLimited)
+		}
+	}()
+	wg.Wait()
+}
+
+// TestFiveHourZeroUtilizationIsSelectable exercises utilization = 0.
+func TestFiveHourZeroUtilizationIsSelectable(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("auth-a", 0, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
+	if decisionError != nil || response.AuthID != "auth-a" {
+		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 }

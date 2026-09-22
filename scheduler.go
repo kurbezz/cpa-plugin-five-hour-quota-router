@@ -71,7 +71,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
-		if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
+		if r.cache.isExcluded(candidate.ID, now, cfg.CutoffPercentUsed) {
 			blockedCandidates++
 			continue
 		}
@@ -102,6 +102,9 @@ func isClaudeRequest(req pluginapi.SchedulerPickRequest) bool {
 
 func isProtectedModel(model string, protectedModels []string) bool {
 	model = strings.TrimSpace(model)
+	if len(protectedModels) == 0 {
+		return model != ""
+	}
 	if model == "" {
 		return false
 	}

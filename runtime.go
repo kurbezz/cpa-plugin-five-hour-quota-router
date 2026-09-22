@@ -293,11 +293,11 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		}
 		return
 	}
-	r.cache.recordSuccess(auth.ID, result.WeeklyPercentUsed, result.ResetAt, r.now())
+	r.cache.recordSuccess(auth.ID, result.FiveHourPercentUsed, result.ResetAt, r.now())
 	r.log("debug", "quota router quota refreshed", map[string]any{
-		"auth_id":             auth.ID,
-		"weekly_percent_used": result.WeeklyPercentUsed,
-		"blocked":             result.WeeklyPercentUsed >= cfg.CutoffPercentUsed,
+		"auth_id":                auth.ID,
+		"five_hour_percent_used": result.FiveHourPercentUsed,
+		"blocked":                result.FiveHourPercentUsed >= cfg.CutoffPercentUsed,
 	})
 }
 

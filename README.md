@@ -1,40 +1,49 @@
-# CLIProxyAPI Quota Router
+# CLIProxyAPI Five-Hour Quota Router
 
-Quota-aware account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin routes configured protected models away from OAuth accounts when provider usage reaches a configurable cutoff, while leaving other models on CLIProxyAPI's native scheduler. This release supports Anthropic's seven-day usage quota; the provider-specific usage adapter can expand when another provider exposes equivalent data.
+Quota-aware account routing for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). The plugin routes configured protected models away from Claude OAuth accounts when Anthropic's rolling five-hour usage window reaches a configurable cutoff, while leaving other models on CLIProxyAPI's native scheduler. This release supports Anthropic's five-hour usage quota (`five_hour` in the `/api/oauth/usage` response, with a `limits[]` fallback for the newer response shape).
 
-The default specifically protects `claude-fable-5` at 50%. This matches Anthropic's [June 30 redeployment announcement](https://www.anthropic.com/news/redeploying-fable-5), which included Fable 5 for up to 50% of weekly usage through July 7, 2026; Anthropic said access would use usage credits afterward, so both the model and cutoff remain configurable.
+By default, `protected-models` is empty, which means **every** Claude model is protected. Set `protected-models` to a specific list if you only want to gate a subset of models.
 
 ## Install
 
-Download the archive for your platform from [Releases](https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router/releases), extract the library into CLIProxyAPI's plugin directory, and configure it by plugin ID:
+Extract the built library into CLIProxyAPI's plugin directory, and configure it by plugin ID:
 
 ```yaml
 plugins:
   enabled: true
   configs:
-    quota-router:
+    five-hour-quota-router:
       enabled: true
       priority: 100
-      protected-models: [claude-fable-5]
-      cutoff-percent-used: 50
-      poll-interval: 5m
+      # protected-models: [claude-opus-4-1]   # optional; empty/omitted protects ALL Claude models
+      cutoff-percent-used: 95
+      poll-interval: 60s
       request-timeout: 10s
+      # user-agent: claude-code/2.1.80        # optional override, see "User-Agent" below
 ```
 
-The library basename must be `quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
+The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
 
-`poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer.
+`poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer. Default: `60s`.
 
 ## Behavior
 
 - Refreshes enabled physical Claude OAuth credentials when the worker starts; startup reconfiguration retries discovery only while the cache is empty. There is no time-driven polling.
 - When a protected-model request selects an account whose cached usage is at least `poll-interval` old, queues one asynchronous refresh for that account while routing the current request from memory.
-- Coalesces concurrent refreshes, and does not refresh a known blocked account again before its reported reset time.
+- Coalesces concurrent refreshes, and does not refresh a known excluded account again before its reported reset time.
 - A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
-- Applies only to exact, case-insensitive `protected-models` matches.
-- Blocks an account at or above `cutoff-percent-used`; unknown or reset-expired quota state fails open while a refresh is queued.
+- Applies only to exact, case-insensitive `protected-models` matches; an empty `protected-models` list matches every non-empty Claude model name.
+- Excludes an account at or above `cutoff-percent-used`.
+- **Scheduling exclusion is fail-closed for credentials that have never produced a successful usage sample**: until a poll succeeds at least once for a given credential, it is excluded from protected-model scheduling. This avoids ever routing traffic to an account whose real quota state is unknown.
+- **A credential whose last known reset time has passed is fail-open**: it is trusted to be available again immediately, without waiting for a fresh poll, because Anthropic's five-hour window genuinely rolls over at `resets_at`. This is a narrow, deliberate exception scoped to confirmed window expiry — not a general "unknown quota" fail-open.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
-- Exposes authenticated status at `GET /v0/management/plugins/quota-router/status`.
+- Exposes authenticated status at `GET /v0/management/plugins/five-hour-quota-router/status`.
+
+## User-Agent
+
+Anthropic's `/api/oauth/usage` endpoint is undocumented, and in practice it aggressively and persistently rate-limits requests whose `User-Agent` header doesn't match Claude Code's own client string. To work around this, the plugin sends `User-Agent: claude-code/2.1.80` by default on every usage request. This is an unofficial compatibility workaround, not sanctioned by Anthropic, and may need to be updated (via the `user-agent` config field) if Anthropic changes this behavior in the future.
+
+Note: because `activeRuntime` (and its HTTP fetcher) is constructed once at plugin process init, before the first config load, changing `user-agent` in `config.yaml` requires a plugin process restart to take effect.
 
 ## Build and test
 
@@ -47,4 +56,4 @@ make build
 
 Release tags matching `v*` build store-compatible archives and `checksums.txt` through GitHub Actions.
 
-Created and published by [Smarty Pants Inc](https://github.com/Smarty-Pants-Inc). MIT licensed.
+MIT licensed. This is a fork of [Smarty Pants Inc's cpa-plugin-quota-router v0.5.0](https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router). GitHub repository placeholder used for plugin metadata: https://github.com/kurbezz/five-hour-quota-router (not necessarily published).

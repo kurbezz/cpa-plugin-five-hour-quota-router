@@ -15,27 +15,27 @@ type cutoffStatusResponse struct {
 }
 
 type cutoffAccountStatus struct {
-	ID                string   `json:"id"`
-	AuthIndex         string   `json:"auth_index,omitempty"`
-	Name              string   `json:"name,omitempty"`
-	Known             bool     `json:"known"`
-	Blocked           bool     `json:"blocked"`
-	WeeklyPercentUsed *float64 `json:"weekly_percent_used,omitempty"`
-	SampledAt         string   `json:"sampled_at,omitempty"`
-	ResetAt           string   `json:"reset_at,omitempty"`
-	LastErrorCategory string   `json:"last_error_category,omitempty"`
+	ID                  string   `json:"id"`
+	AuthIndex           string   `json:"auth_index,omitempty"`
+	Name                string   `json:"name,omitempty"`
+	Known               bool     `json:"known"`
+	Blocked             bool     `json:"blocked"`
+	FiveHourPercentUsed *float64 `json:"five_hour_percent_used,omitempty"`
+	SampledAt           string   `json:"sampled_at,omitempty"`
+	ResetAt             string   `json:"reset_at,omitempty"`
+	LastErrorCategory   string   `json:"last_error_category,omitempty"`
 }
 
 type quotaSample struct {
-	AuthIndex         string
-	Name              string
-	Identity          string
-	HasSample         bool
-	WeeklyPercentUsed float64
-	SampledAt         time.Time
-	LastAttemptAt     time.Time
-	ResetAt           time.Time
-	LastErrorCategory string
+	AuthIndex           string
+	Name                string
+	Identity            string
+	HasSample           bool
+	FiveHourPercentUsed float64
+	SampledAt           time.Time
+	LastAttemptAt       time.Time
+	ResetAt             time.Time
+	LastErrorCategory   string
 }
 
 func (s quotaSample) known(now time.Time) bool {
@@ -43,7 +43,23 @@ func (s quotaSample) known(now time.Time) bool {
 }
 
 func (s quotaSample) blocked(now time.Time, cutoff float64) bool {
-	return s.known(now) && s.WeeklyPercentUsed >= cutoff
+	return s.known(now) && s.FiveHourPercentUsed >= cutoff
+}
+
+// excluded reports whether this credential should be excluded from five-hour-protected
+// scheduling. Fail-closed: a credential that has never produced a successful sample is
+// excluded (we cannot assume it is safe). A sample whose reset time has passed is treated
+// as available again without waiting for a fresh poll, because Anthropic's five-hour window
+// genuinely rolls over at resets_at — this is a deliberate, scoped fail-open specific to
+// confirmed window expiry, not a general unknown-quota fail-open.
+func (s quotaSample) excluded(now time.Time, cutoff float64) bool {
+	if !s.HasSample {
+		return true
+	}
+	if !s.ResetAt.IsZero() && !now.Before(s.ResetAt) {
+		return false
+	}
+	return s.FiveHourPercentUsed >= cutoff
 }
 
 type quotaCache struct {
@@ -122,7 +138,7 @@ func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, 
 	c.mu.Lock()
 	sample := c.samples[authID]
 	sample.HasSample = true
-	sample.WeeklyPercentUsed = percentUsed
+	sample.FiveHourPercentUsed = percentUsed
 	sample.SampledAt = sampledAt
 	sample.LastAttemptAt = sampledAt
 	sample.ResetAt = resetAt
@@ -149,6 +165,13 @@ func (c *quotaCache) isBlocked(authID string, now time.Time, cutoff float64) boo
 	return sample.blocked(now, cutoff)
 }
 
+func (c *quotaCache) isExcluded(authID string, now time.Time, cutoff float64) bool {
+	c.mu.Lock()
+	sample := c.samples[authID]
+	c.mu.Unlock()
+	return sample.excluded(now, cutoff)
+}
+
 func (c *quotaCache) snapshot(authID string) quotaSample {
 	c.mu.Lock()
 	sample := c.samples[authID]
@@ -168,12 +191,12 @@ func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStat
 			AuthIndex:         sample.AuthIndex,
 			Name:              sample.Name,
 			Known:             known,
-			Blocked:           sample.blocked(now, cutoff),
+			Blocked:           sample.excluded(now, cutoff),
 			LastErrorCategory: sample.LastErrorCategory,
 		}
 		if known {
-			percentUsed := sample.WeeklyPercentUsed
-			account.WeeklyPercentUsed = &percentUsed
+			percentUsed := sample.FiveHourPercentUsed
+			account.FiveHourPercentUsed = &percentUsed
 			if !sample.SampledAt.IsZero() {
 				account.SampledAt = sample.SampledAt.UTC().Format(time.RFC3339Nano)
 			}

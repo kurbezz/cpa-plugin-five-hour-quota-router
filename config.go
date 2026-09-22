@@ -24,6 +24,7 @@ type rawPluginConfig struct {
 	CutoffPercentUsed *float64  `yaml:"cutoff-percent-used"`
 	PollInterval      string    `yaml:"poll-interval"`
 	RequestTimeout    string    `yaml:"request-timeout"`
+	UserAgent         string    `yaml:"user-agent"`
 }
 
 type pluginConfig struct {
@@ -32,6 +33,7 @@ type pluginConfig struct {
 	CutoffPercentUsed float64
 	PollInterval      time.Duration
 	RequestTimeout    time.Duration
+	UserAgent         string
 }
 
 type registration struct {
@@ -57,10 +59,11 @@ type managementRoute struct {
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:           true,
-		ProtectedModels:   []string{defaultProtectedModel},
+		ProtectedModels:   nil,
 		CutoffPercentUsed: defaultCutoffPercentUsed,
 		PollInterval:      defaultPollInterval,
 		RequestTimeout:    defaultRequestTimeout,
+		UserAgent:         defaultAnthropicUserAgent,
 	}
 }
 
@@ -106,6 +109,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 		}
 		cfg.RequestTimeout = timeout
 	}
+	if value := strings.TrimSpace(decoded.UserAgent); value != "" {
+		cfg.UserAgent = value
+	}
 	if math.IsNaN(cfg.CutoffPercentUsed) || math.IsInf(cfg.CutoffPercentUsed, 0) || cfg.CutoffPercentUsed < 0 || cfg.CutoffPercentUsed > 100 {
 		return pluginConfig{}, fmt.Errorf("cutoff-percent-used must be between 0 and 100")
 	}
@@ -119,9 +125,6 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 }
 
 func normalizeProtectedModels(models []string) ([]string, error) {
-	if len(models) == 0 {
-		return nil, fmt.Errorf("protected-models must contain at least one model")
-	}
 	normalized := make([]string, 0, len(models))
 	seen := make(map[string]struct{}, len(models))
 	for _, model := range models {
@@ -136,6 +139,9 @@ func normalizeProtectedModels(models []string) ([]string, error) {
 		normalized = append(normalized, model)
 	}
 	sort.Strings(normalized)
+	if len(normalized) == 0 {
+		return nil, nil
+	}
 	return normalized, nil
 }
 
@@ -152,28 +158,33 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
-			Author:           "Smarty Pants Inc",
-			GitHubRepository: "https://github.com/Smarty-Pants-Inc/cpa-plugin-quota-router",
+			Author:           "kurbezz (fork of Smarty Pants Inc cpa-plugin-quota-router v0.5.0)",
+			GitHubRepository: "https://github.com/kurbezz/five-hour-quota-router",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "protected-models",
 					Type:        pluginapi.ConfigFieldTypeArray,
-					Description: "Exact Claude model IDs whose routing is paused at the weekly cutoff. Default: [claude-fable-5].",
+					Description: "Exact Claude model IDs whose routing is paused at the five-hour cutoff. Default: empty, which protects ALL Claude models.",
 				},
 				{
 					Name:        "cutoff-percent-used",
 					Type:        pluginapi.ConfigFieldTypeNumber,
-					Description: "Blocks a Claude auth when seven_day utilization reaches this percent used. Default: 50.",
+					Description: "Excludes a Claude auth from scheduling when its five_hour utilization (falling back to limits[] where kind=session) reaches this percent used. Default: 95.",
 				},
 				{
 					Name:        "poll-interval",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 5m.",
+					Description: "Minimum cached-usage age before a protected-model request queues another refresh. Default: 60s.",
 				},
 				{
 					Name:        "request-timeout",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "Anthropic usage request timeout as a Go duration. Default: 10s.",
+				},
+				{
+					Name:        "user-agent",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "User-Agent sent with requests to Anthropic's undocumented /api/oauth/usage endpoint. That endpoint's rate-limit bucketing is keyed by User-Agent, and requests not matching Claude Code's own client string are aggressively and persistently throttled. Default: claude-code/2.1.80. Requires a plugin process restart to take effect.",
 				},
 			},
 		},

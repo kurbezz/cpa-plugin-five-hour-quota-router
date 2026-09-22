@@ -12,23 +12,25 @@ import (
 )
 
 type usageResult struct {
-	WeeklyPercentUsed float64
-	ResetAt           time.Time
+	FiveHourPercentUsed float64
+	ResetAt             time.Time
 }
 
 type usageFetcher func(context.Context, string, time.Duration) (usageResult, string)
 
 type httpUsageFetcher struct {
-	client   *http.Client
-	endpoint string
+	client    *http.Client
+	endpoint  string
+	userAgent string
 }
 
-func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper) httpUsageFetcher {
+func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper, userAgent string) httpUsageFetcher {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
 	return httpUsageFetcher{
-		endpoint: endpoint,
+		endpoint:  endpoint,
+		userAgent: userAgent,
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -38,13 +40,25 @@ func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper) httpUsage
 	}
 }
 
+// usageResponse handles two observed shapes of Anthropic's undocumented
+// /api/oauth/usage response:
+//
+//	Shape A (flat, common):  {"five_hour": {"utilization": 35.0, "resets_at": "..."}}
+//	Shape B (newer):         {"five_hour": null, "limits": [{"kind": "session", "percent": 33, "resets_at": "..."}]}
 type usageResponse struct {
-	SevenDay *usageWindow `json:"seven_day"`
+	FiveHour *usageWindow `json:"five_hour"`
+	Limits   []usageLimit `json:"limits"`
 }
 
 type usageWindow struct {
 	Utilization *float64        `json:"utilization"`
 	ResetsAt    json.RawMessage `json:"resets_at"`
+}
+
+type usageLimit struct {
+	Kind     string          `json:"kind"`
+	Percent  *float64        `json:"percent"`
+	ResetsAt json.RawMessage `json:"resets_at"`
 }
 
 func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.Duration) (usageResult, string) {
@@ -58,6 +72,9 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", anthropicOAuthBeta)
+	if f.userAgent != "" {
+		req.Header.Set("User-Agent", f.userAgent)
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -106,22 +123,39 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	if json.Unmarshal(body, &payload) != nil {
 		return usageResult{}, pollErrorInvalidJSON
 	}
-	if payload.SevenDay == nil {
-		return usageResult{}, pollErrorInvalidWeekly
+
+	if payload.FiveHour != nil && payload.FiveHour.Utilization != nil {
+		percentUsed, ok := normalizeUtilization(payload.FiveHour.Utilization)
+		if !ok {
+			return usageResult{}, pollErrorInvalidUsage
+		}
+		resetAt, ok := parseResetTime(payload.FiveHour.ResetsAt)
+		if !ok {
+			return usageResult{}, pollErrorInvalidUsage
+		}
+		return usageResult{FiveHourPercentUsed: percentUsed, ResetAt: resetAt}, ""
 	}
-	percentUsed, ok := normalizeWeeklyPercent(payload.SevenDay.Utilization)
-	if !ok {
-		return usageResult{}, pollErrorInvalidWeekly
+
+	for _, entry := range payload.Limits {
+		if !strings.EqualFold(entry.Kind, "session") || entry.Percent == nil {
+			continue
+		}
+		percentUsed, ok := normalizeUtilization(entry.Percent)
+		if !ok {
+			return usageResult{}, pollErrorInvalidUsage
+		}
+		resetAt, ok := parseResetTime(entry.ResetsAt)
+		if !ok {
+			return usageResult{}, pollErrorInvalidUsage
+		}
+		return usageResult{FiveHourPercentUsed: percentUsed, ResetAt: resetAt}, ""
 	}
-	resetAt, ok := parseResetTime(payload.SevenDay.ResetsAt)
-	if !ok {
-		return usageResult{}, pollErrorInvalidWeekly
-	}
-	return usageResult{WeeklyPercentUsed: percentUsed, ResetAt: resetAt}, ""
+
+	return usageResult{}, pollErrorInvalidUsage
 }
 
 // Anthropic reports percentage points: 1.0 means 1%, not 100%.
-func normalizeWeeklyPercent(raw *float64) (float64, bool) {
+func normalizeUtilization(raw *float64) (float64, bool) {
 	if raw == nil || math.IsNaN(*raw) || math.IsInf(*raw, 0) || *raw < 0 || *raw > 100 {
 		return 0, false
 	}
