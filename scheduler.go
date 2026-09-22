@@ -58,6 +58,24 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	if !cfg.Enabled || !isClaudeRequest(req) || !isProtectedModel(req.Model, cfg.ProtectedModels) {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
+	// Diagnostic: log exactly which candidates the host presented for this
+	// pick, so we can tell host-side pre-filtering apart from a scheduler bug.
+	// Safe: only IDs, provider, priority, status - never tokens or auth JSON.
+	candidateSummaries := make([]map[string]any, 0, len(req.Candidates))
+	for i := range req.Candidates {
+		c := &req.Candidates[i]
+		candidateSummaries = append(candidateSummaries, map[string]any{
+			"id":       c.ID,
+			"provider": c.Provider,
+			"priority": c.Priority,
+			"status":   c.Status,
+		})
+	}
+	r.log("warn", "five-hour quota router pick candidates snapshot", map[string]any{
+		"model":           req.Model,
+		"candidate_count": len(req.Candidates),
+		"candidates":      candidateSummaries,
+	})
 	now := r.now()
 	var selected *pluginapi.SchedulerAuthCandidate
 	var fallbackCandidate *pluginapi.SchedulerAuthCandidate
