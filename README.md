@@ -20,6 +20,7 @@ plugins:
       poll-interval: 60s
       request-timeout: 10s
       # user-agent: claude-code/2.1.80        # optional override, see "User-Agent" below
+      overage-fallback-enabled: true          # optional; see "Overage fallback" below (default: true)
 ```
 
 The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
@@ -44,6 +45,18 @@ The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `
 Anthropic's `/api/oauth/usage` endpoint is undocumented, and in practice it aggressively and persistently rate-limits requests whose `User-Agent` header doesn't match Claude Code's own client string. To work around this, the plugin sends `User-Agent: claude-code/2.1.80` by default on every usage request. This is an unofficial compatibility workaround, not sanctioned by Anthropic, and may need to be updated (via the `user-agent` config field) if Anthropic changes this behavior in the future.
 
 Note: because `activeRuntime` (and its HTTP fetcher) is constructed once at plugin process init, before the first config load, changing `user-agent` in `config.yaml` requires a plugin process restart to take effect.
+
+## Overage fallback (`overage-fallback-enabled`)
+
+**Default: `true`.** When every Claude candidate for a request has been **confirmed** to be over `cutoff-percent-used` (a successful usage sample exists, is not yet reset, and its `five_hour_percent_used >= cutoff-percent-used`), the plugin will, as a last resort, route the request to the confirmed-over-cutoff credential with the highest CPA `priority` (ties broken by lowest AuthID, matching the tie-break rule used for normal selection) instead of returning `five_hour_quota_exhausted`. This deliberately accepts Anthropic Extra Usage/overage billing on that one subscription, trading cost-avoidance for availability.
+
+**Critical safety boundary — read carefully:** this fallback triggers *only* when exhaustion is confirmed for every candidate. If even one candidate is merely **unknown** — never successfully sampled, unreachable, or not yet polled — the fallback does **not** trigger, and the request still hard-blocks with `five_hour_quota_exhausted`, regardless of `overage-fallback-enabled`. The plugin will never blindly route billable traffic to a credential whose quota status it has not actually confirmed; it only does so for a credential it has confirmed is genuinely over its five-hour limit.
+
+To restore strict hard-blocking once every account is exhausted (i.e. disable overage billing entirely), set:
+
+```yaml
+overage-fallback-enabled: false
+```
 
 ## Build and test
 

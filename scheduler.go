@@ -60,7 +60,8 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	}
 	now := r.now()
 	var selected *pluginapi.SchedulerAuthCandidate
-	claudeCandidates, blockedCandidates := 0, 0
+	var fallbackCandidate *pluginapi.SchedulerAuthCandidate
+	claudeCandidates, blockedCandidates, confirmedOverCutoffCount := 0, 0, 0
 	for i := range req.Candidates {
 		candidate := &req.Candidates[i]
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
@@ -71,8 +72,18 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
+		// Track the highest-priority (tie-break: lowest ID) candidate across
+		// ALL claude candidates unconditionally, so it's available for the
+		// overage fallback regardless of which branch executes below.
+		if fallbackCandidate == nil || candidate.Priority > fallbackCandidate.Priority ||
+			(candidate.Priority == fallbackCandidate.Priority && candidate.ID < fallbackCandidate.ID) {
+			fallbackCandidate = candidate
+		}
 		if r.cache.isExcluded(candidate.ID, now, cfg.CutoffPercentUsed) {
 			blockedCandidates++
+			if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
+				confirmedOverCutoffCount++
+			}
 			continue
 		}
 		if selected == nil || candidate.Priority > selected.Priority ||
@@ -85,6 +96,17 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}, nil
 	}
 	if claudeCandidates > 0 && blockedCandidates == claudeCandidates {
+		// Only fall back to overage billing when every excluded candidate is
+		// CONFIRMED over cutoff (isBlocked), never when any candidate is merely
+		// unknown/unreachable (isExcluded but not isBlocked).
+		if cfg.OverageFallbackEnabled && confirmedOverCutoffCount == claudeCandidates && fallbackCandidate != nil {
+			r.log("warn", "five-hour quota router routing to confirmed over-cutoff credential (overage fallback)", map[string]any{
+				"auth_id":  fallbackCandidate.ID,
+				"priority": fallbackCandidate.Priority,
+			})
+			r.queueCandidateRefresh(fallbackCandidate.ID, cfg, now)
+			return pluginapi.SchedulerPickResponse{AuthID: fallbackCandidate.ID, Handled: true}, nil
+		}
 		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
 	}
 	return pluginapi.SchedulerPickResponse{Handled: false}, nil

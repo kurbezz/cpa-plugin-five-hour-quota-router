@@ -129,6 +129,7 @@ plugins:
       cutoff-percent-used: 95
       poll-interval: 50ms
       request-timeout: 1s
+      overage-fallback-enabled: false
 `, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir, e2eProtectedModel)
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
 		t.Fatal(err)

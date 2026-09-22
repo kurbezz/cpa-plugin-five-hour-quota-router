@@ -183,12 +183,16 @@ func waitFor(t *testing.T, condition func() bool) {
 func TestCurrentCutoffIsDerivedFromConfig(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
 	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 	if _, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0))); decisionError == nil {
 		t.Fatal("96% sample should be excluded at the default cutoff")
 	}
-	cfg := defaultPluginConfig()
+	cfg = defaultPluginConfig()
 	cfg.CutoffPercentUsed = 97
+	cfg.OverageFallbackEnabled = false
 	runtime.config.Store(&cfg)
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
 	if decisionError != nil || response.AuthID != "auth-a" {
@@ -211,6 +215,12 @@ func TestSchedulerOnlyHandlesProtectedModels(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
+	// Disable overage fallback so exhaustion still hard-blocks; this test is
+	// about protected-model matching, not overage-fallback semantics (which
+	// are covered separately).
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
 
 	// Default config has an empty protected-models list, meaning ALL Claude
 	// models are protected.
@@ -221,7 +231,8 @@ func TestSchedulerOnlyHandlesProtectedModels(t *testing.T) {
 		}
 	}
 
-	cfg := defaultPluginConfig()
+	cfg = defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
 	cfg.ProtectedModels = []string{"claude-sonnet-4-6"}
 	runtime.config.Store(&cfg)
 	response, decisionError := runtime.pick(claudeModelRequest(testModel, candidate("auth-a", 0)))
@@ -271,6 +282,9 @@ func TestDisableClearsCachedQuota(t *testing.T) {
 func TestWhitespaceAuthIDIsIgnored(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
 	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(
 		candidate("auth-a", 0),
@@ -297,6 +311,12 @@ func TestCutoffBoundary(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runtime := newTestRuntime(&fakeHost{}, nil, now)
+			// Disable overage fallback: this test is about the cutoff
+			// boundary itself, not the single-candidate overage-fallback
+			// self-selection case (which would otherwise mask the error).
+			cfg := defaultPluginConfig()
+			cfg.OverageFallbackEnabled = false
+			runtime.config.Store(&cfg)
 			runtime.cache.recordSuccess("auth-a", test.percent, now.Add(time.Hour), now)
 			response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0)))
 			if test.wantError {
@@ -540,15 +560,112 @@ func TestTwoCandidatesOneExcludedOnePicksAvailable(t *testing.T) {
 }
 
 // TestBothCandidatesExcludedReturnsExhaustedError exercises the all-excluded
-// path returning the exhausted error code.
+// path returning the exhausted error code when overage fallback is disabled.
 func TestBothCandidatesExcludedReturnsExhaustedError(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
 	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
 	runtime.cache.recordSuccess("B", 96, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
 	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
 		t.Fatalf("response = %#v, error = %#v, want exhausted", response, decisionError)
+	}
+}
+
+// TestOverageFallbackRoutesToHighestPriorityConfirmedOverCutoff exercises the
+// default (overage-fallback-enabled unset, so it defaults to true) behavior:
+// when every candidate is CONFIRMED over cutoff, route to the one with the
+// highest CPA priority instead of hard-blocking.
+func TestOverageFallbackRoutesToHighestPriorityConfirmedOverCutoff(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	// Do not touch cfg.OverageFallbackEnabled: prove the default (true) applies.
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("B", 96, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if decisionError != nil || !response.Handled || response.AuthID != "A" {
+		t.Fatalf("response = %#v, error = %#v, want overage fallback to A (highest priority)", response, decisionError)
+	}
+}
+
+// TestOverageFallbackDisabledRestoresHardBlock is a regression check that
+// explicitly setting overage-fallback-enabled: false restores the strict
+// five_hour_quota_exhausted hard-block once every candidate is confirmed
+// over cutoff.
+func TestOverageFallbackDisabledRestoresHardBlock(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("B", 96, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("response = %#v, error = %#v, want hard-blocked exhausted error", response, decisionError)
+	}
+}
+
+// TestOverageFallbackNeverTriggersForUnknownCandidate is the critical
+// safety-boundary test: candidate A is CONFIRMED over cutoff (has a
+// successful sample >= cutoff, not yet reset), but candidate B has NEVER
+// been successfully sampled (unknown/unreachable state). Even with
+// overage-fallback-enabled at its default (true), the fallback must NOT
+// trigger, because we cannot confirm B's true quota state — blindly routing
+// billable overage traffic to A while B's state is unconfirmed would defeat
+// the entire point of requiring confirmed exhaustion for every candidate.
+// The plugin must still return the hard five_hour_quota_exhausted error.
+func TestOverageFallbackNeverTriggersForUnknownCandidate(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	// A: confirmed over cutoff.
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	// B: never sampled — intentionally no recordSuccess call. HasSample stays false.
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if response.Handled {
+		t.Fatalf("overage fallback must not trigger when any candidate is unknown: response = %#v", response)
+	}
+	if decisionError == nil || decisionError.Code != exhaustedErrorCode {
+		t.Fatalf("expected hard-blocked exhausted error when a candidate is unknown, got error = %#v", decisionError)
+	}
+	if response.AuthID == "A" {
+		t.Fatal("must never route to A while B's quota state is unconfirmed")
+	}
+}
+
+// TestOverageFallbackTieBreaksByLowestID verifies the deterministic
+// tie-break rule (lowest AuthID wins on equal priority) applies to the
+// overage-fallback candidate selection too, matching the existing
+// convention used for normal selection.
+func TestOverageFallbackTieBreaksByLowestID(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.recordSuccess("z-auth", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("a-auth", 96, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("z-auth", 10), candidate("a-auth", 10)))
+	if decisionError != nil || !response.Handled || response.AuthID != "a-auth" {
+		t.Fatalf("response = %#v, error = %#v, want overage fallback to a-auth (lowest ID tie-break)", response, decisionError)
+	}
+}
+
+// TestOverageFallbackNeverInvokedWhenACandidateIsAvailable is a sanity
+// regression: as soon as at least one candidate is not excluded, normal
+// selection is used and fallback tracking is never consulted, even if other
+// candidates are confirmed over cutoff.
+func TestOverageFallbackNeverInvokedWhenACandidateIsAvailable(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	// A is confirmed over cutoff and has the highest priority; B is available
+	// (under cutoff) but lower priority. Normal selection must still pick B,
+	// since the overage fallback only applies when ALL candidates are excluded.
+	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("B", 10, now.Add(time.Hour), now)
+	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
+	if decisionError != nil || !response.Handled || response.AuthID != "B" {
+		t.Fatalf("response = %#v, error = %#v, want normal selection of B despite A's higher priority", response, decisionError)
 	}
 }
 
@@ -598,6 +715,9 @@ func TestSchedulerRespectsRequestCandidateList(t *testing.T) {
 func TestAllClaudeCandidatesBlockedReturnsExplicitError(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
 	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
 	runtime.cache.recordSuccess("auth-b", 99, now.Add(time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0), candidate("auth-b", 0)))
@@ -1004,6 +1124,10 @@ func TestBlockedAuthSleepsUntilReset(t *testing.T) {
 	runtime := newPluginRuntime(host, fetcher.fetch, clock.now)
 	cfg := defaultPluginConfig()
 	cfg.PollInterval = 5 * time.Minute
+	// Disable overage fallback: this test is about reset-based cache
+	// refresh timing, not the single-candidate overage-fallback
+	// self-selection case (covered separately).
+	cfg.OverageFallbackEnabled = false
 	runtime.applyConfig(cfg)
 	defer runtime.shutdown()
 	waitFor(t, func() bool { return fetcher.callCount() == 1 })
@@ -1210,7 +1334,7 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	enabled := true
 	cutoff := 42.5
 	raw, errMarshal := json.Marshal(lifecycleRequest{ConfigYAML: []byte(
-		"enabled: true\nprotected-models: [claude-sonnet-4-6, CLAUDE-OPUS-4-1, claude-sonnet-4-6]\ncutoff-percent-used: 42.5\npoll-interval: 30s\nrequest-timeout: 2s\nuser-agent: custom-agent/1.0\n",
+		"enabled: true\nprotected-models: [claude-sonnet-4-6, CLAUDE-OPUS-4-1, claude-sonnet-4-6]\ncutoff-percent-used: 42.5\npoll-interval: 30s\nrequest-timeout: 2s\nuser-agent: custom-agent/1.0\noverage-fallback-enabled: false\n",
 	)})
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
@@ -1219,11 +1343,11 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	if errConfig != nil {
 		t.Fatal(errConfig)
 	}
-	if cfg.Enabled != enabled || strings.Join(cfg.ProtectedModels, ",") != "claude-opus-4-1,claude-sonnet-4-6" || cfg.CutoffPercentUsed != cutoff || cfg.PollInterval != 30*time.Second || cfg.RequestTimeout != 2*time.Second || cfg.UserAgent != "custom-agent/1.0" {
+	if cfg.Enabled != enabled || strings.Join(cfg.ProtectedModels, ",") != "claude-opus-4-1,claude-sonnet-4-6" || cfg.CutoffPercentUsed != cutoff || cfg.PollInterval != 30*time.Second || cfg.RequestTimeout != 2*time.Second || cfg.UserAgent != "custom-agent/1.0" || cfg.OverageFallbackEnabled != false {
 		t.Fatalf("config = %#v", cfg)
 	}
 	defaults, errDefaults := decodeLifecycleConfig([]byte("{}"))
-	if errDefaults != nil || len(defaults.ProtectedModels) != 0 || defaults.CutoffPercentUsed != defaultCutoffPercentUsed || defaults.PollInterval != defaultPollInterval || defaults.UserAgent != defaultAnthropicUserAgent {
+	if errDefaults != nil || len(defaults.ProtectedModels) != 0 || defaults.CutoffPercentUsed != defaultCutoffPercentUsed || defaults.PollInterval != defaultPollInterval || defaults.UserAgent != defaultAnthropicUserAgent || defaults.OverageFallbackEnabled != true {
 		t.Fatalf("default config = %#v, error = %v", defaults, errDefaults)
 	}
 
@@ -1262,7 +1386,8 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 		fields["cutoff-percent-used"] != pluginapi.ConfigFieldTypeNumber ||
 		fields["poll-interval"] != pluginapi.ConfigFieldTypeString ||
 		fields["request-timeout"] != pluginapi.ConfigFieldTypeString ||
-		fields["user-agent"] != pluginapi.ConfigFieldTypeString {
+		fields["user-agent"] != pluginapi.ConfigFieldTypeString ||
+		fields["overage-fallback-enabled"] != pluginapi.ConfigFieldTypeBoolean {
 		t.Fatalf("config fields = %#v", fields)
 	}
 }

@@ -19,21 +19,23 @@ type lifecycleRequest struct {
 }
 
 type rawPluginConfig struct {
-	Enabled           *bool     `yaml:"enabled"`
-	ProtectedModels   *[]string `yaml:"protected-models"`
-	CutoffPercentUsed *float64  `yaml:"cutoff-percent-used"`
-	PollInterval      string    `yaml:"poll-interval"`
-	RequestTimeout    string    `yaml:"request-timeout"`
-	UserAgent         string    `yaml:"user-agent"`
+	Enabled                *bool     `yaml:"enabled"`
+	ProtectedModels        *[]string `yaml:"protected-models"`
+	CutoffPercentUsed      *float64  `yaml:"cutoff-percent-used"`
+	PollInterval           string    `yaml:"poll-interval"`
+	RequestTimeout         string    `yaml:"request-timeout"`
+	UserAgent              string    `yaml:"user-agent"`
+	OverageFallbackEnabled *bool     `yaml:"overage-fallback-enabled"`
 }
 
 type pluginConfig struct {
-	Enabled           bool
-	ProtectedModels   []string
-	CutoffPercentUsed float64
-	PollInterval      time.Duration
-	RequestTimeout    time.Duration
-	UserAgent         string
+	Enabled                bool
+	ProtectedModels        []string
+	CutoffPercentUsed      float64
+	PollInterval           time.Duration
+	RequestTimeout         time.Duration
+	UserAgent              string
+	OverageFallbackEnabled bool
 }
 
 type registration struct {
@@ -58,12 +60,13 @@ type managementRoute struct {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:           true,
-		ProtectedModels:   nil,
-		CutoffPercentUsed: defaultCutoffPercentUsed,
-		PollInterval:      defaultPollInterval,
-		RequestTimeout:    defaultRequestTimeout,
-		UserAgent:         defaultAnthropicUserAgent,
+		Enabled:                true,
+		ProtectedModels:        nil,
+		CutoffPercentUsed:      defaultCutoffPercentUsed,
+		PollInterval:           defaultPollInterval,
+		RequestTimeout:         defaultRequestTimeout,
+		UserAgent:              defaultAnthropicUserAgent,
+		OverageFallbackEnabled: true,
 	}
 }
 
@@ -111,6 +114,9 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	}
 	if value := strings.TrimSpace(decoded.UserAgent); value != "" {
 		cfg.UserAgent = value
+	}
+	if decoded.OverageFallbackEnabled != nil {
+		cfg.OverageFallbackEnabled = *decoded.OverageFallbackEnabled
 	}
 	if math.IsNaN(cfg.CutoffPercentUsed) || math.IsInf(cfg.CutoffPercentUsed, 0) || cfg.CutoffPercentUsed < 0 || cfg.CutoffPercentUsed > 100 {
 		return pluginConfig{}, fmt.Errorf("cutoff-percent-used must be between 0 and 100")
@@ -185,6 +191,11 @@ func pluginRegistration() registration {
 					Name:        "user-agent",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "User-Agent sent with requests to Anthropic's undocumented /api/oauth/usage endpoint. That endpoint's rate-limit bucketing is keyed by User-Agent, and requests not matching Claude Code's own client string are aggressively and persistently throttled. Default: claude-code/2.1.80. Requires a plugin process restart to take effect.",
+				},
+				{
+					Name:        "overage-fallback-enabled",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "When every Claude credential is confirmed over the five-hour cutoff (not merely unknown/unreachable), route to the confirmed-over-cutoff credential with the highest CPA priority instead of blocking the request, accepting Anthropic Extra Usage/overage billing on that credential. Default: true. Set to false to restore hard-blocking (five_hour_quota_exhausted) once every account is exhausted.",
 				},
 			},
 		},
