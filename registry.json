@@ -6,7 +6,7 @@
       "name": "Five-Hour Quota Router",
       "description": "Routes Claude OAuth traffic by confirmed five_hour utilization, excluding accounts at or over cutoff. Fail-closed for never-sampled credentials. Optional overage fallback to the highest-priority confirmed-over-cutoff credential.",
       "author": "kurbezz",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "auth_required": false,
       "install": {
         "type": "direct",
@@ -14,8 +14,8 @@
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/kurbezz/cpa-plugin-five-hour-quota-router/releases/download/v0.1.0/five-hour-quota-router_0.1.0_linux_amd64.zip",
-            "sha256": "cb54293d43ff95839914e362093bc0ffbc21a0f70c18e751ac12d1c33245863d"
+            "url": "https://github.com/kurbezz/cpa-plugin-five-hour-quota-router/releases/download/v0.1.1/five-hour-quota-router_0.1.1_linux_amd64.zip",
+            "sha256": "8c667169c6882a26605cac4c67efe106955ade501a7b06a27d3cc7a3ffb4662b"
           }
         ]
       }
