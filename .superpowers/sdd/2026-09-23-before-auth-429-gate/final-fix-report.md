@@ -47,3 +47,9 @@ Validation: `go build ./...`, `go vet ./...`, `go test ./...` (131), `go test -r
 - Added a test-host log hook so refresh commits can be observed through channels without polling or real throttle waits.
 
 Validation: targeted worker test, `go build ./...`, `go vet ./...`, `go test ./...` (131), `go test -race ./...` (130), and `git diff --check` passed.
+
+## Final whole-branch replacement fix
+- Targeted discovery now unions physical-identity `replaced` IDs with list-metadata `changed` IDs before target filtering, preserving B's targeted revision recovery when only A was requested.
+- Added deterministic A-targeted/B-physical-replacement recovery regression without a subsequent interceptor or fleet refresh.
+
+Validation: `go build ./...`, `go vet ./...`, `go test ./...` (132), `go test -race ./...` (131), and `git diff --check` passed.

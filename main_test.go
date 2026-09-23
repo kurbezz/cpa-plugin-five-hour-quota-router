@@ -1624,6 +1624,41 @@ func TestOverlapUsageAndRevisionGetFailureRetainsRevisionIntent(t *testing.T) {
 	}
 }
 
+func TestTargetedRefreshQueuesOtherPhysicalIdentityReplacement(t *testing.T) {
+	now := time.Now().UTC()
+	entryA := physicalEntry("auth-a", "index-a")
+	entryB := physicalEntry("auth-b", "index-b")
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+		"index-a": credentialJSON("token-a"), "index-b": credentialJSON("old-b"),
+	}}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-a": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+		"old-b":   {{result: usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}}},
+		"new-b":   {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, time.Now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = time.Nanosecond
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool {
+		return runtime.cache.snapshot("auth-a").HasSample && runtime.cache.snapshot("auth-b").HasSample
+	})
+	host.mu.Lock()
+	updated := host.entries[1]
+	updated.Path = "/fixtures/replaced-b.json"
+	host.entries[1] = updated
+	host.authJSON["index-b"] = credentialJSON("new-b")
+	host.mu.Unlock()
+	// Only A is selected. Its discovery must preserve B's physical replacement
+	// signal and schedule B's targeted recovery without another discovery pass.
+	runtime.refreshAuths(context.Background(), cfg, false, map[string]struct{}{"auth-a": {}}, nil)
+	waitFor(t, func() bool {
+		s := runtime.cache.snapshot("auth-b")
+		return s.HasSample && s.FiveHourPercentUsed == 10
+	})
+}
+
 func TestRefreshWorkerPromotesDeferredRevisionWithoutDelayingReadyTargetedUsage(t *testing.T) {
 	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	clock := &testClock{value: now}
