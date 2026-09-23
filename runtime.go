@@ -297,6 +297,24 @@ func (r *pluginRuntime) queueRevisionCheck(authID string) {
 	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
 		return
 	}
+	r.queueRevisionCheckLocked(authID)
+}
+
+// queueRevisionCheckFromWorker is for refresh-loop work that has already
+// passed lifecycle validation. It must not acquire lifecycleMu: stopLocked
+// holds that mutex while waiting for the worker to exit, and a discovery pass
+// may find changed metadata immediately before it observes cancellation.
+func (r *pluginRuntime) queueRevisionCheckFromWorker(authID string) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	r.queueRevisionCheckLocked(authID)
+}
+
+// queueRevisionCheckLocked enqueues under refreshMu. Its caller either holds
+// lifecycleMu (the external path) or is the active refresh worker.
+func (r *pluginRuntime) queueRevisionCheckLocked(authID string) {
 	r.refreshMu.Lock()
 	if r.pendingRevisionIDs == nil {
 		r.pendingRevisionIDs = make(map[string]struct{})
@@ -392,7 +410,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	// is polled in this pass, while other IDs receive their own later revision
 	// check instead of silently losing replacement detection.
 	for authID := range changed {
-		r.queueRevisionCheck(authID)
+		r.queueRevisionCheckFromWorker(authID)
 	}
 	for _, auth := range auths {
 		if ctx.Err() != nil {

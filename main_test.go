@@ -26,6 +26,24 @@ type fakeHost struct {
 	logs      []string
 }
 
+// pausedDiscoveryHost pauses exactly one auth-list discovery pass. It lets
+// lifecycle tests hold shutdown/config-disable in stopLocked while the worker
+// later discovers a metadata change.
+type pausedDiscoveryHost struct {
+	*fakeHost
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (h *pausedDiscoveryHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
+	h.once.Do(func() {
+		close(h.started)
+		<-h.release
+	})
+	return h.fakeHost.listAuth()
+}
+
 func (h *fakeHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1678,6 +1696,64 @@ func TestTargetedRefreshRetainsOtherAuthRevisionSignal(t *testing.T) {
 		sample := runtime.cache.snapshot("auth-b")
 		return sample.HasSample && sample.FiveHourPercentUsed == 10
 	})
+}
+
+func TestWorkerMetadataEnqueueDoesNotDeadlockLifecycleStop(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		stop func(*pluginRuntime)
+	}{
+		{name: "shutdown", stop: func(r *pluginRuntime) { r.shutdown() }},
+		{name: "config disable", stop: func(r *pluginRuntime) {
+			cfg := r.loadedConfig()
+			cfg.Enabled = false
+			r.applyConfig(cfg)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entryA := physicalEntry("auth-a", "index-a")
+			entryB := physicalEntry("auth-b", "index-b")
+			base := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+				"index-a": credentialJSON("token-a"), "index-b": credentialJSON("token-b"),
+			}}
+			release := make(chan struct{})
+			host := &pausedDiscoveryHost{fakeHost: base, started: make(chan struct{}), release: release}
+			runtime := newPluginRuntime(host, (&fakeFetcher{}).fetch, time.Now)
+			// Seed the old list state so the paused worker detects B's changed
+			// metadata after it is released.
+			runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entryA, entryB}))
+			updatedB := entryB
+			updatedB.ModTime = updatedB.ModTime.Add(time.Second)
+			base.entries[1] = updatedB
+
+			cfg := defaultPluginConfig()
+			runtime.applyConfig(cfg)
+			select {
+			case <-host.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("worker did not pause at discovery")
+			}
+
+			done := make(chan struct{})
+			go func() {
+				test.stop(runtime)
+				close(done)
+			}()
+			waitFor(t, func() bool {
+				if runtime.lifecycleMu.TryLock() {
+					runtime.lifecycleMu.Unlock()
+					return false
+				}
+				return true
+			})
+			close(release)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("lifecycle stop deadlocked after worker discovery")
+			}
+		})
+	}
 }
 
 func TestDisabledAuthIsNotPolled(t *testing.T) {
