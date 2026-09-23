@@ -147,6 +147,10 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			r.queueCandidateRefresh(fallbackCandidate.ID, cfg, now)
 			return pluginapi.SchedulerPickResponse{AuthID: fallbackCandidate.ID, Handled: true}, nil
 		}
+		// This is the scheduler-level backstop for state that changes after
+		// before-auth admission. Keep the safe reset-derived retry metadata on
+		// this error when it is known; the scheduler ABI itself cannot emit an
+		// HTTP Retry-After header.
 		resetAt, hasReset := r.cache.earliestFutureReset(claudeCandidateIDs, now)
 		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, resetAt, hasReset)}
 	}

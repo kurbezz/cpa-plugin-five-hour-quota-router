@@ -908,9 +908,11 @@ func TestTwoCandidatesOneExcludedOnePicksAvailable(t *testing.T) {
 	}
 }
 
-// TestBothCandidatesExcludedReturnsExhaustedError exercises the all-excluded
-// path returning the exhausted error code when overage fallback is disabled.
-func TestBothCandidatesExcludedReturnsExhaustedError(t *testing.T) {
+// TestSchedulerHardExhaustionIncludesKnownResetRetryMetadata preserves the
+// scheduler-level backstop for a state change after before-auth admission. It
+// must return the reset-derived metadata when fallback is disabled and every
+// scheduler candidate is confirmed exhausted.
+func TestSchedulerHardExhaustionIncludesKnownResetRetryMetadata(t *testing.T) {
 	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	cfg := defaultPluginConfig()

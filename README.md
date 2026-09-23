@@ -40,6 +40,14 @@ The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
 - Exposes authenticated status at `GET /v0/management/plugins/five-hour-quota-router/status`.
 
+## HTTP 429 and retry behavior
+
+With `overage-fallback-enabled: false`, the request interceptor returns a **pre-upstream HTTP 429** only when **all physical Claude OAuth credentials** are confirmed exhausted for the current five-hour window. Confirmation requires a successful sample at or above the cutoff and a known reset time that is still in the future. An available credential, an unknown/unreachable/not-yet-polled credential, a zero reset, or a reset that has already passed does not trigger this HTTP gate.
+
+When the earliest reset is known, the 429 includes `Retry-After` (whole seconds, rounded up) and a JSON body with `code: "five_hour_quota_exhausted"` plus a message containing `retry_after_seconds` and `resets_at`. The plugin never fabricates a wait: unknown, zero, or past reset state has no retry metadata and does not produce the pre-upstream 429.
+
+The scheduler retains `five_hour_quota_exhausted` with the same reset-derived message metadata as a backstop if quota state changes after before-auth admission. Its ABI cannot emit an HTTP status or `Retry-After` header. Whether OpenCode retries this 429 (and honors its retry information) must be verified in the deployed provider path; do not assume OpenCode retry behavior from the plugin alone.
+
 ## User-Agent
 
 Anthropic's `/api/oauth/usage` endpoint is undocumented, and in practice it aggressively and persistently rate-limits requests whose `User-Agent` header doesn't match Claude Code's own client string. To work around this, the plugin sends `User-Agent: claude-code/2.1.80` by default on every usage request. This is an unofficial compatibility workaround, not sanctioned by Anthropic, and may need to be updated (via the `user-agent` config field) if Anthropic changes this behavior in the future.
@@ -51,8 +59,6 @@ Note: because `activeRuntime` (and its HTTP fetcher) is constructed once at plug
 **Default: `true`.** When every Claude candidate for a request has been **confirmed** to be over `cutoff-percent-used` (a successful usage sample exists, is not yet reset, and its `five_hour_percent_used >= cutoff-percent-used`), the plugin will, as a last resort, route the request to the confirmed-over-cutoff credential with the highest CPA `priority` (ties broken by lowest AuthID, matching the tie-break rule used for normal selection) instead of returning `five_hour_quota_exhausted`. This deliberately accepts Anthropic Extra Usage/overage billing on that one subscription, trading cost-avoidance for availability.
 
 **Critical safety boundary — read carefully:** this fallback triggers *only* when exhaustion is confirmed for every candidate. If even one candidate is merely **unknown** — never successfully sampled, unreachable, or not yet polled — the fallback does **not** trigger, and the request still hard-blocks with `five_hour_quota_exhausted`, regardless of `overage-fallback-enabled`. The plugin will never blindly route billable traffic to a credential whose quota status it has not actually confirmed; it only does so for a credential it has confirmed is genuinely over its five-hour limit.
-
-On a hard exhaustion, the scheduler returns `five_hour_quota_exhausted`. When it has a future known five-hour reset, it appends informational `retry_after_seconds` and `resets_at` metadata to that error message. This can help an explicit client wrapper decide when to retry, but the scheduler ABI cannot emit HTTP 429 or `Retry-After`, and OpenCode does not automatically honor this metadata without wrapper/client support.
 
 To restore strict hard-blocking once every account is exhausted (i.e. disable overage billing entirely), set:
 
