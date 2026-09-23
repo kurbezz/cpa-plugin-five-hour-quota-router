@@ -158,6 +158,19 @@ func (c *quotaCache) empty() bool {
 	return len(c.samples) == 0
 }
 
+// memberIDs returns the membership from the same reconciled cache state used
+// for quota admission. It is used when a discovery response is superseded
+// before it can safely update that state.
+func (c *quotaCache) memberIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids := make([]string, 0, len(c.samples))
+	for authID := range c.samples {
+		ids = append(ids, authID)
+	}
+	return ids
+}
+
 // reconcile updates membership and returns IDs invalidated by a physical
 // identity replacement under the same auth ID.
 func (c *quotaCache) reconcile(auths []physicalClaudeAuth) (map[string]struct{}, map[string]struct{}) {

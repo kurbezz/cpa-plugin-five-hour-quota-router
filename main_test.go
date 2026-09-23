@@ -37,6 +37,32 @@ type pausedDiscoveryHost struct {
 	once    sync.Once
 }
 
+// overlappingDiscoveryHost returns an older snapshot only after a newer
+// discovery has completed. This models concurrent interceptor/worker list
+// calls whose responses finish out of order.
+type overlappingDiscoveryHost struct {
+	*fakeHost
+	oldStarted chan struct{}
+	oldRelease <-chan struct{}
+	mu         sync.Mutex
+	calls      int
+}
+
+func (h *overlappingDiscoveryHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
+	h.mu.Lock()
+	h.calls++
+	call := h.calls
+	h.mu.Unlock()
+	if call == 1 {
+		close(h.oldStarted)
+		<-h.oldRelease
+		return []pluginapi.HostAuthFileEntry{physicalEntry("auth-a", "index-a")}, nil
+	}
+	return []pluginapi.HostAuthFileEntry{
+		physicalEntry("auth-a", "index-a"), physicalEntry("auth-b", "index-b"),
+	}, nil
+}
+
 func (h *pausedDiscoveryHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
 	h.once.Do(func() {
 		close(h.started)
@@ -206,6 +232,39 @@ func TestInterceptBeforeAuthConfirmedExhaustionTerminates(t *testing.T) {
 	_, getCalls := host.counts()
 	if getCalls != 0 {
 		t.Fatalf("interceptor called host.auth.get %d times", getCalls)
+	}
+}
+
+func TestOverlappingDiscoveryDoesNotPruneNewAvailableAuth(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	releaseOld := make(chan struct{})
+	host := &overlappingDiscoveryHost{
+		fakeHost:   &fakeHost{},
+		oldStarted: make(chan struct{}),
+		oldRelease: releaseOld,
+	}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	runtime.cache.recordSuccess("auth-a", 100, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-b", 50, now.Add(time.Hour), now)
+
+	oldDone := make(chan pluginapi.RequestInterceptResponse, 1)
+	go func() { oldDone <- runtime.interceptBeforeAuth(beforeAuthRequest()) }()
+	<-host.oldStarted
+
+	newResponse := runtime.interceptBeforeAuth(beforeAuthRequest())
+	if newResponse.Terminate {
+		t.Fatalf("new [A,B] discovery produced false 429: %#v", newResponse)
+	}
+	close(releaseOld)
+	oldResponse := <-oldDone
+	if oldResponse.Terminate {
+		t.Fatalf("stale [A] discovery pruned available B and produced false 429: %#v", oldResponse)
+	}
+	if sample := runtime.cache.snapshot("auth-b"); !sample.HasSample || sample.FiveHourPercentUsed != 50 {
+		t.Fatalf("available B was pruned or changed by stale discovery: %#v", sample)
 	}
 }
 

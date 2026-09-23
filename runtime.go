@@ -35,13 +35,23 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 
 	// Membership discovery is the only synchronous host operation here. A
 	// failure must not turn an uncertain credential set into a broad HTTP gate.
-	entries, err := r.host.listAuth()
+	auths, replaced, changed, current, err := r.discoverAuths()
 	if err != nil {
 		r.log("warn", "five-hour quota router before-auth membership discovery failed", map[string]any{"category": "auth_list"})
 		return pluginapi.RequestInterceptResponse{}
 	}
-	auths := physicalClaudeAuths(entries)
-	replaced, changed := r.cache.reconcile(auths)
+	// A list response that began before a newer completed response must not
+	// prune that newer membership. Use the reconciled membership for this
+	// admission decision and avoid scheduling work from the stale response.
+	if !current {
+		authIDs := r.cache.memberIDs()
+		now := r.now()
+		resetAt, hasReset := r.cache.confirmedExhaustedReset(authIDs, now, cfg.CutoffPercentUsed)
+		if !hasReset {
+			return pluginapi.RequestInterceptResponse{}
+		}
+		return r.exhaustedInterceptResponse(now, resetAt, hasReset)
+	}
 	authIDs := make([]string, 0, len(auths))
 	for _, auth := range auths {
 		authIDs = append(authIDs, auth.ID)
@@ -68,6 +78,10 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 	if !hasReset {
 		return pluginapi.RequestInterceptResponse{}
 	}
+	return r.exhaustedInterceptResponse(now, resetAt, hasReset)
+}
+
+func (r *pluginRuntime) exhaustedInterceptResponse(now time.Time, resetAt time.Time, hasReset bool) pluginapi.RequestInterceptResponse {
 	body, err := json.Marshal(struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
@@ -115,25 +129,56 @@ type claudeCredential struct {
 }
 
 type pluginRuntime struct {
-	lifecycleMu        sync.Mutex
-	refreshMu          sync.Mutex
-	config             atomic.Pointer[pluginConfig]
-	cache              quotaCache
-	host               hostClient
-	fetch              usageFetcher
-	now                func() time.Time
-	wake               chan struct{}
-	cancel             context.CancelFunc
-	done               chan struct{}
-	pendingAll         bool
-	pendingIDs         map[string]struct{}
-	pendingRevisionIDs map[string]struct{}
+	lifecycleMu sync.Mutex
+	refreshMu   sync.Mutex
+	// discoveryMu orders completed host.auth.list snapshots. Calls remain
+	// concurrent, but a snapshot issued before a newer completed one is never
+	// allowed to reconcile and delete its newer membership.
+	discoveryMu         sync.Mutex
+	discoveryIssued     uint64
+	discoveryReconciled uint64
+	config              atomic.Pointer[pluginConfig]
+	cache               quotaCache
+	host                hostClient
+	fetch               usageFetcher
+	now                 func() time.Time
+	wake                chan struct{}
+	cancel              context.CancelFunc
+	done                chan struct{}
+	pendingAll          bool
+	pendingIDs          map[string]struct{}
+	pendingRevisionIDs  map[string]struct{}
 	// deferredRevisionIDs is owned as lifecycle state under refreshMu. Delayed
 	// revision retries are promoted by refreshLoop's timer, never by detached
 	// goroutines, so an old runtime cannot enqueue into a restarted one.
 	deferredRevisionIDs map[string]time.Time
 	inFlightAll         bool
 	inFlightIDs         map[string]struct{}
+}
+
+// discoverAuths reconciles a host.auth.list snapshot unless a later-issued
+// discovery has already completed. This rejects out-of-order list responses
+// while retaining concurrent host calls on the request and worker paths.
+func (r *pluginRuntime) discoverAuths() ([]physicalClaudeAuth, map[string]struct{}, map[string]struct{}, bool, error) {
+	r.discoveryMu.Lock()
+	r.discoveryIssued++
+	generation := r.discoveryIssued
+	r.discoveryMu.Unlock()
+
+	entries, err := r.host.listAuth()
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	auths := physicalClaudeAuths(entries)
+
+	r.discoveryMu.Lock()
+	defer r.discoveryMu.Unlock()
+	if generation < r.discoveryReconciled {
+		return auths, nil, nil, false, nil
+	}
+	replaced, changed := r.cache.reconcile(auths)
+	r.discoveryReconciled = generation
+	return auths, replaced, changed, true, nil
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -447,7 +492,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	if r == nil || r.host == nil || r.fetch == nil || ctx.Err() != nil {
 		return
 	}
-	entries, err := r.host.listAuth()
+	auths, replaced, changed, current, err := r.discoverAuths()
 	if err != nil {
 		r.log("warn", "five-hour quota router auth discovery failed", map[string]any{"category": "auth_list"})
 		for authID := range revisionIDs {
@@ -455,8 +500,9 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 		}
 		return
 	}
-	auths := physicalClaudeAuths(entries)
-	replaced, changed := r.cache.reconcile(auths)
+	if !current {
+		return
+	}
 	// A targeted worker pass still receives the complete auth listing. Preserve
 	// metadata-change signals for every listed credential; only the selected ID
 	// is polled in this pass, while other IDs receive their own later revision
