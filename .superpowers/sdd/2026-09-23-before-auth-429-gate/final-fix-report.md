@@ -41,3 +41,9 @@ Additional validation after final review: `go build ./...`, `go vet ./...`, `go 
 - Added deterministic regression proving throttled revision A does not delay ready targeted usage B.
 
 Validation: `go build ./...`, `go vet ./...`, `go test ./...` (131), `go test -race ./...` (130), and `git diff --check` passed.
+
+## Deferred revision worker test follow-up
+- Replaced the synchronous deferred-A/ready-B regression with a deterministic refresh-worker test. It pauses A's worker discovery, establishes A's deferred throttle deadline, queues ready targeted B through the runtime queue, requires B's committed refresh before the deadline, then advances a controlled clock and wakes the worker to assert A is promoted and committed.
+- Added a test-host log hook so refresh commits can be observed through channels without polling or real throttle waits.
+
+Validation: targeted worker test, `go build ./...`, `go vet ./...`, `go test ./...` (131), `go test -race ./...` (130), and `git diff --check` passed.

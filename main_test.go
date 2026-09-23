@@ -21,6 +21,7 @@ type fakeHost struct {
 	authJSON  map[string]json.RawMessage
 	getErrors map[string]error
 	listError error
+	logHook   func(level, message string, fields map[string]any)
 	listCalls int
 	getCalls  []string
 	logs      []string
@@ -66,9 +67,13 @@ func (h *fakeHost) getAuth(authIndex string) (json.RawMessage, error) {
 
 func (h *fakeHost) log(level, message string, fields map[string]any) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	raw, _ := json.Marshal(map[string]any{"level": level, "message": message, "fields": fields})
 	h.logs = append(h.logs, string(raw))
+	hook := h.logHook
+	h.mu.Unlock()
+	if hook != nil {
+		hook(level, message, fields)
+	}
 }
 
 func (h *fakeHost) counts() (int, int) {
@@ -1619,40 +1624,96 @@ func TestOverlapUsageAndRevisionGetFailureRetainsRevisionIntent(t *testing.T) {
 	}
 }
 
-func TestThrottledRevisionDoesNotDelayReadyTargetedUsage(t *testing.T) {
-	now := time.Now().UTC()
+func TestRefreshWorkerPromotesDeferredRevisionWithoutDelayingReadyTargetedUsage(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	clock := &testClock{value: now}
 	entryA := physicalEntry("auth-a", "index-a")
 	entryB := physicalEntry("auth-b", "index-b")
-	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
-		"index-a": credentialJSON("token-a"), "index-b": credentialJSON("token-b"),
-	}}
-	bFetched := make(chan struct{})
-	runtime := newTestRuntime(host, func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
-		if token == "token-b" {
-			close(bFetched)
-		}
+	discoveryStarted := make(chan struct{})
+	releaseDiscovery := make(chan struct{})
+	bCommitted := make(chan struct{})
+	aCommitted := make(chan struct{})
+	var bCommitOnce, aCommitOnce sync.Once
+	host := &pausedDiscoveryHost{
+		fakeHost: &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+			"index-a": credentialJSON("token-a"), "index-b": credentialJSON("token-b"),
+		}, logHook: func(_ string, message string, fields map[string]any) {
+			if message != "five-hour quota router quota refreshed" {
+				return
+			}
+			switch fields["auth_id"] {
+			case "auth-a":
+				aCommitOnce.Do(func() { close(aCommitted) })
+			case "auth-b":
+				bCommitOnce.Do(func() { close(bCommitted) })
+			}
+		}},
+		started: discoveryStarted,
+		release: releaseDiscovery,
+	}
+	runtime := newPluginRuntime(host, func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
 		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
-	}, now)
-	runtime.wake = make(chan struct{}, 1)
+	}, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = time.Hour
+	runtime.config.Store(&cfg)
 	auths := physicalClaudeAuths(host.entries)
 	runtime.cache.reconcile(auths)
-	if !runtime.cache.claimRevisionCheck("auth-a", now, time.Hour) {
+	if !runtime.cache.claimRevisionCheck("auth-a", now, cfg.PollInterval) {
 		t.Fatal("seed A revision throttle")
 	}
-	// A's deferred revision work returns immediately to the worker; B's ready
-	// targeted usage is not held behind A's throttle deadline.
-	runtime.checkAuthRevision(context.Background(), auths[0], defaultPluginConfig())
-	runtime.pollAuth(context.Background(), auths[1], defaultPluginConfig(), false)
+
+	// Run the actual refresh worker with an otherwise controlled clock. Pausing
+	// its first discovery pass establishes that A's revision check is in the
+	// worker before B is queued.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	runtime.wake, runtime.cancel, runtime.done = make(chan struct{}, 1), cancel, done
+	go runtime.refreshLoop(ctx, runtime.wake, done)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	runtime.queueRevisionCheck("auth-a")
 	select {
-	case <-bFetched:
+	case <-discoveryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not begin A revision discovery")
+	}
+	close(releaseDiscovery)
+	// A's throttled revision check must defer and return the serial worker to
+	// ready work; B is eligible targeted usage, not a synchronous bypass.
+	runtime.queueCandidateRefresh("auth-b", cfg, clock.now())
+	select {
+	case <-bCommitted:
 	case <-time.After(time.Second):
 		t.Fatal("ready B usage was delayed by throttled A revision")
 	}
+	if !clock.now().Before(now.Add(cfg.PollInterval)) {
+		t.Fatal("B committed after A's deferred deadline")
+	}
 	runtime.refreshMu.Lock()
-	_, deferred := runtime.deferredRevisionIDs["auth-a"]
+	due, deferred := runtime.deferredRevisionIDs["auth-a"]
 	runtime.refreshMu.Unlock()
-	if !deferred {
-		t.Fatal("throttled A revision was not deferred")
+	if !deferred || !due.Equal(now.Add(cfg.PollInterval)) {
+		t.Fatalf("throttled A revision was not deferred to its deadline: due=%v deferred=%t", due, deferred)
+	}
+
+	// Wake the real worker after advancing only the controlled clock; this
+	// avoids a real one-hour wait while exercising refreshLoop's timer promotion.
+	clock.set(now.Add(cfg.PollInterval))
+	select {
+	case runtime.wake <- struct{}{}:
+	default:
+	}
+	select {
+	case <-aCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("deferred A revision was not promoted at its deadline")
+	}
+	if sample := runtime.cache.snapshot("auth-a"); !sample.LastRevisionCheckAt.Equal(clock.now()) || !sample.HasSample {
+		t.Fatalf("promoted A revision did not commit: %#v", sample)
 	}
 }
 
