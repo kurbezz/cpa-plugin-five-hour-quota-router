@@ -100,7 +100,8 @@ func (c *quotaCache) allConfirmedExhausted(authIDs []string, now time.Time, cuto
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, authID := range authIDs {
-		if !c.samples[authID].blocked(now, cutoff) {
+		sample := c.samples[authID]
+		if sample.ResetAt.IsZero() || !sample.blocked(now, cutoff) {
 			return false
 		}
 	}

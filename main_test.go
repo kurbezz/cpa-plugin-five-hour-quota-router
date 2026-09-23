@@ -618,6 +618,41 @@ func TestAllConfirmedExhausted(t *testing.T) {
 		}
 	})
 
+	for _, test := range []struct {
+		name    string
+		resetAt time.Time
+	}{
+		{name: "zero reset", resetAt: time.Time{}},
+		{name: "past reset", resetAt: now.Add(-time.Second)},
+		{name: "reset equal to now", resetAt: now},
+	} {
+		t.Run(test.name+" prevents confirmed exhaustion", func(t *testing.T) {
+			cache := quotaCache{samples: map[string]quotaSample{}}
+			cache.recordSuccess("a", 95, test.resetAt, now)
+
+			if cache.allConfirmedExhausted([]string{"a"}, now, 95) {
+				t.Fatal("non-future reset must prevent confirmed exhaustion")
+			}
+		})
+	}
+
+	t.Run("duplicate exhausted credentials remain confirmed exhausted", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+		cache.recordSuccess("a", 95, now.Add(time.Hour), now)
+
+		if !cache.allConfirmedExhausted([]string{"a", "a"}, now, 95) {
+			t.Fatal("duplicate exhausted credentials should remain confirmed exhausted")
+		}
+	})
+
+	t.Run("duplicate unknown credentials prevent confirmed exhaustion", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+
+		if cache.allConfirmedExhausted([]string{"a", "a"}, now, 95) {
+			t.Fatal("duplicate unknown credentials must prevent confirmed exhaustion")
+		}
+	})
+
 	t.Run("no credentials are not confirmed exhausted", func(t *testing.T) {
 		cache := quotaCache{samples: map[string]quotaSample{}}
 		if cache.allConfirmedExhausted(nil, now, 95) {
