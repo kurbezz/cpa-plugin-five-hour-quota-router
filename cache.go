@@ -89,6 +89,24 @@ func (c *quotaCache) earliestFutureReset(authIDs []string, now time.Time) (time.
 	return earliest, !earliest.IsZero()
 }
 
+// allConfirmedExhausted reports whether every supplied credential has a
+// successful, unexpired sample at or above the cutoff. It deliberately uses
+// blocked rather than excluded so unknown credentials cannot cause admission
+// blocking.
+func (c *quotaCache) allConfirmedExhausted(authIDs []string, now time.Time, cutoff float64) bool {
+	if len(authIDs) == 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, authID := range authIDs {
+		if !c.samples[authID].blocked(now, cutoff) {
+			return false
+		}
+	}
+	return true
+}
+
 // exhaustedErrorMessage adds safe retry metadata only when a future reset is
 // known. The scheduler ABI has no HTTP status or Retry-After header support.
 func exhaustedErrorMessage(now time.Time, resetAt time.Time, hasReset bool) string {

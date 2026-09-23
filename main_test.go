@@ -586,6 +586,46 @@ func TestNonClaudeRequestsAreUnhandled(t *testing.T) {
 	}
 }
 
+func TestAllConfirmedExhausted(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+
+	t.Run("every credential is sampled over cutoff with a future reset", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+		cache.recordSuccess("a", 95, now.Add(30*time.Minute), now)
+		cache.recordSuccess("b", 100, now.Add(10*time.Minute), now)
+
+		if !cache.allConfirmedExhausted([]string{"a", "b"}, now, 95) {
+			t.Fatal("want confirmed exhaustion")
+		}
+	})
+
+	t.Run("an under-cutoff sibling prevents confirmed exhaustion", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+		cache.recordSuccess("a", 95, now.Add(30*time.Minute), now)
+		cache.recordSuccess("b", 94.9, now.Add(10*time.Minute), now)
+
+		if cache.allConfirmedExhausted([]string{"a", "b"}, now, 95) {
+			t.Fatal("under-cutoff sibling must prevent confirmed exhaustion")
+		}
+	})
+
+	t.Run("a never-sampled sibling prevents confirmed exhaustion", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+		cache.recordSuccess("a", 95, now.Add(30*time.Minute), now)
+
+		if cache.allConfirmedExhausted([]string{"a", "b"}, now, 95) {
+			t.Fatal("never-sampled sibling must prevent confirmed exhaustion")
+		}
+	})
+
+	t.Run("no credentials are not confirmed exhausted", func(t *testing.T) {
+		cache := quotaCache{samples: map[string]quotaSample{}}
+		if cache.allConfirmedExhausted(nil, now, 95) {
+			t.Fatal("no credentials must not be confirmed exhausted")
+		}
+	})
+}
+
 func TestClaudeSelectionIgnoresExcludedCandidates(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
