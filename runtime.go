@@ -386,7 +386,14 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 		return
 	}
 	auths := physicalClaudeAuths(entries)
-	_, _ = r.cache.reconcile(auths)
+	_, changed := r.cache.reconcile(auths)
+	// A targeted worker pass still receives the complete auth listing. Preserve
+	// metadata-change signals for every listed credential; only the selected ID
+	// is polled in this pass, while other IDs receive their own later revision
+	// check instead of silently losing replacement detection.
+	for authID := range changed {
+		r.queueRevisionCheck(authID)
+	}
 	for _, auth := range auths {
 		if ctx.Err() != nil {
 			return

@@ -1642,6 +1642,44 @@ func TestRevisionSignalInsideThrottleIsRetainedAndTargetsOnlyChangedAuth(t *test
 	}
 }
 
+func TestTargetedRefreshRetainsOtherAuthRevisionSignal(t *testing.T) {
+	now := time.Now().UTC()
+	entryA := physicalEntry("auth-a", "index-a")
+	entryB := physicalEntry("auth-b", "index-b")
+	entryA.Path, entryB.Path = "/fixtures/a.json", "/fixtures/b.json"
+	entryA.Email, entryB.Email = "", ""
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+		"index-a": credentialJSON("token-a"), "index-b": credentialJSON("old-b"),
+	}}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"token-a": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+		"old-b":   {{result: usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}}},
+		"new-b":   {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, time.Now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled, cfg.PollInterval = false, time.Nanosecond
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool {
+		return runtime.cache.snapshot("auth-a").HasSample && runtime.cache.snapshot("auth-b").HasSample
+	})
+
+	host.mu.Lock()
+	host.authJSON["index-b"] = credentialJSON("new-b")
+	updatedB := host.entries[1]
+	updatedB.ModTime = updatedB.ModTime.Add(time.Second)
+	host.entries[1] = updatedB
+	host.mu.Unlock()
+	// Request only A. Its worker auth.list sees B's changed metadata, but it
+	// must retain B's revision signal for an independently targeted check.
+	runtime.refreshAuths(context.Background(), cfg, false, map[string]struct{}{"auth-a": {}}, nil)
+	waitFor(t, func() bool {
+		sample := runtime.cache.snapshot("auth-b")
+		return sample.HasSample && sample.FiveHourPercentUsed == 10
+	})
+}
+
 func TestDisabledAuthIsNotPolled(t *testing.T) {
 	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{disabledEntry("auth-a", "index-a")}}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{}}
