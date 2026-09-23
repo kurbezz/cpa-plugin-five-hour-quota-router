@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -65,6 +67,39 @@ func (s quotaSample) excluded(now time.Time, cutoff float64) bool {
 type quotaCache struct {
 	mu      sync.Mutex
 	samples map[string]quotaSample
+}
+
+// earliestFutureReset returns the earliest future reset from successful cache
+// samples for the supplied scheduler candidates. Unknown samples and missing,
+// expired, or zero reset times intentionally provide no retry information.
+func (c *quotaCache) earliestFutureReset(authIDs []string, now time.Time) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var earliest time.Time
+	for _, authID := range authIDs {
+		sample := c.samples[authID]
+		if !sample.HasSample || sample.ResetAt.IsZero() || !now.Before(sample.ResetAt) {
+			continue
+		}
+		if earliest.IsZero() || sample.ResetAt.Before(earliest) {
+			earliest = sample.ResetAt
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
+// exhaustedErrorMessage adds safe retry metadata only when a future reset is
+// known. The scheduler ABI has no HTTP status or Retry-After header support.
+func exhaustedErrorMessage(now time.Time, resetAt time.Time, hasReset bool) string {
+	if !hasReset || resetAt.IsZero() || !now.Before(resetAt) {
+		return exhaustedErrorCode
+	}
+	retryAfterSeconds := int64(math.Ceil(resetAt.Sub(now).Seconds()))
+	if retryAfterSeconds < 1 {
+		retryAfterSeconds = 1
+	}
+	return fmt.Sprintf("%s; retry_after_seconds=%d; resets_at=%s", exhaustedErrorCode, retryAfterSeconds, resetAt.UTC().Format(time.RFC3339))
 }
 
 func (c *quotaCache) empty() bool {

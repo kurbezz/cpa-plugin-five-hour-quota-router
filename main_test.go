@@ -617,15 +617,17 @@ func TestTwoCandidatesOneExcludedOnePicksAvailable(t *testing.T) {
 // TestBothCandidatesExcludedReturnsExhaustedError exercises the all-excluded
 // path returning the exhausted error code when overage fallback is disabled.
 func TestBothCandidatesExcludedReturnsExhaustedError(t *testing.T) {
-	now := time.Now().UTC()
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	cfg := defaultPluginConfig()
 	cfg.OverageFallbackEnabled = false
 	runtime.config.Store(&cfg)
-	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
-	runtime.cache.recordSuccess("B", 96, now.Add(time.Hour), now)
+	resetA := now.Add(90 * time.Second)
+	runtime.cache.recordSuccess("A", 99, resetA, now)
+	runtime.cache.recordSuccess("B", 96, now.Add(2*time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
-	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode {
+	wantMessage := "five_hour_quota_exhausted; retry_after_seconds=90; resets_at=2026-09-23T12:01:30Z"
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != wantMessage {
 		t.Fatalf("response = %#v, error = %#v, want exhausted", response, decisionError)
 	}
 }
@@ -674,20 +676,64 @@ func TestOverageFallbackDisabledRestoresHardBlock(t *testing.T) {
 // the entire point of requiring confirmed exhaustion for every candidate.
 // The plugin must still return the hard five_hour_quota_exhausted error.
 func TestOverageFallbackNeverTriggersForUnknownCandidate(t *testing.T) {
-	now := time.Now().UTC()
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	// A: confirmed over cutoff.
-	runtime.cache.recordSuccess("A", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("A", 99, now.Add(75*time.Second), now)
 	// B: never sampled — intentionally no recordSuccess call. HasSample stays false.
 	response, decisionError := runtime.pick(claudeRequest(candidate("A", 100), candidate("B", 1)))
 	if response.Handled {
 		t.Fatalf("overage fallback must not trigger when any candidate is unknown: response = %#v", response)
 	}
-	if decisionError == nil || decisionError.Code != exhaustedErrorCode {
+	wantMessage := "five_hour_quota_exhausted; retry_after_seconds=75; resets_at=2026-09-23T12:01:15Z"
+	if decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != wantMessage {
 		t.Fatalf("expected hard-blocked exhausted error when a candidate is unknown, got error = %#v", decisionError)
 	}
 	if response.AuthID == "A" {
 		t.Fatal("must never route to A while B's quota state is unconfirmed")
+	}
+}
+
+func TestExhaustedErrorWithoutKnownFutureResetUsesLegacyMessage(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	t.Run("all candidates never sampled", func(t *testing.T) {
+		runtime := newTestRuntime(&fakeHost{}, nil, now)
+		response, decisionError := runtime.pick(claudeRequest(candidate("A", 1), candidate("B", 0)))
+		if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != exhaustedErrorCode {
+			t.Fatalf("response = %#v, error = %#v, want legacy exhausted error", response, decisionError)
+		}
+	})
+	t.Run("zero reset plus unknown", func(t *testing.T) {
+		runtime := newTestRuntime(&fakeHost{}, nil, now)
+		runtime.cache.recordSuccess("A", 99, time.Time{}, now)
+		response, decisionError := runtime.pick(claudeRequest(candidate("A", 1), candidate("B", 0)))
+		if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != exhaustedErrorCode {
+			t.Fatalf("response = %#v, error = %#v, want legacy exhausted error", response, decisionError)
+		}
+	})
+}
+
+func TestExhaustedErrorMessageFormatting(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(1100 * time.Millisecond)
+	if got, want := exhaustedErrorMessage(now, resetAt, true), "five_hour_quota_exhausted; retry_after_seconds=2; resets_at=2026-09-23T12:00:01Z"; got != want {
+		t.Fatalf("exhaustedErrorMessage() = %q, want %q", got, want)
+	}
+	for _, test := range []struct {
+		name     string
+		resetAt  time.Time
+		hasReset bool
+	}{
+		{name: "no reset", hasReset: false},
+		{name: "zero reset", resetAt: time.Time{}, hasReset: true},
+		{name: "at now", resetAt: now, hasReset: true},
+		{name: "past", resetAt: now.Add(-time.Second), hasReset: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := exhaustedErrorMessage(now, test.resetAt, test.hasReset); got != exhaustedErrorCode {
+				t.Fatalf("exhaustedErrorMessage() = %q, want %q", got, exhaustedErrorCode)
+			}
+		})
 	}
 }
 
@@ -858,15 +904,16 @@ func TestSchedulerRespectsRequestCandidateList(t *testing.T) {
 }
 
 func TestAllClaudeCandidatesBlockedReturnsExplicitError(t *testing.T) {
-	now := time.Now().UTC()
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	cfg := defaultPluginConfig()
 	cfg.OverageFallbackEnabled = false
 	runtime.config.Store(&cfg)
 	runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
-	runtime.cache.recordSuccess("auth-b", 99, now.Add(time.Hour), now)
+	runtime.cache.recordSuccess("auth-b", 99, now.Add(2*time.Hour), now)
 	response, decisionError := runtime.pick(claudeRequest(candidate("auth-a", 0), candidate("auth-b", 0)))
-	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != exhaustedErrorCode {
+	wantMessage := "five_hour_quota_exhausted; retry_after_seconds=3600; resets_at=2026-09-23T13:00:00Z"
+	if response.Handled || decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != wantMessage {
 		t.Fatalf("response = %#v, error = %#v", response, decisionError)
 	}
 }

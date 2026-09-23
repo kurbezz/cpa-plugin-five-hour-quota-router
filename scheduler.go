@@ -83,33 +83,11 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 	if !cfg.Enabled || !isClaudeRequest(req) || !isProtectedModel(req.Model, cfg.ProtectedModels) {
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
-	// Diagnostic: log exactly which candidates the host presented for this
-	// pick, so we can tell host-side pre-filtering apart from a scheduler bug.
-	// Safe: only IDs, provider, priority, status - never tokens or auth JSON.
-	// Encoded directly into the message string because the host's text log
-	// sink does not print structured Fields, only Message.
-	candidateSummaries := make([]map[string]any, 0, len(req.Candidates))
-	for i := range req.Candidates {
-		c := &req.Candidates[i]
-		candidateSummaries = append(candidateSummaries, map[string]any{
-			"id":       c.ID,
-			"provider": c.Provider,
-			"priority": c.Priority,
-			"weight":   candidateWeight(c),
-			"status":   c.Status,
-		})
-	}
-	if snapshotJSON, errMarshal := json.Marshal(map[string]any{
-		"model":           req.Model,
-		"candidate_count": len(req.Candidates),
-		"candidates":      candidateSummaries,
-	}); errMarshal == nil {
-		r.log("warn", "five-hour quota router pick candidates snapshot "+string(snapshotJSON), nil)
-	}
 	now := r.now()
 	var selected *pluginapi.SchedulerAuthCandidate
 	var fallbackCandidate *pluginapi.SchedulerAuthCandidate
 	claudeCandidates, blockedCandidates, confirmedOverCutoffCount := 0, 0, 0
+	claudeCandidateIDs := make([]string, 0, len(req.Candidates))
 	for i := range req.Candidates {
 		candidate := &req.Candidates[i]
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
@@ -120,6 +98,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
+		claudeCandidateIDs = append(claudeCandidateIDs, candidate.ID)
 		// Track the preferred overage-fallback candidate across ALL claude
 		// candidates unconditionally, so it's available regardless of which
 		// branch executes below. Tie-break order: highest Priority first
@@ -168,7 +147,8 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			r.queueCandidateRefresh(fallbackCandidate.ID, cfg, now)
 			return pluginapi.SchedulerPickResponse{AuthID: fallbackCandidate.ID, Handled: true}, nil
 		}
-		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorCode}
+		resetAt, hasReset := r.cache.earliestFutureReset(claudeCandidateIDs, now)
+		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, resetAt, hasReset)}
 	}
 	return pluginapi.SchedulerPickResponse{Handled: false}, nil
 }

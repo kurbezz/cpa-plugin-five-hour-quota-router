@@ -52,6 +52,8 @@ Note: because `activeRuntime` (and its HTTP fetcher) is constructed once at plug
 
 **Critical safety boundary — read carefully:** this fallback triggers *only* when exhaustion is confirmed for every candidate. If even one candidate is merely **unknown** — never successfully sampled, unreachable, or not yet polled — the fallback does **not** trigger, and the request still hard-blocks with `five_hour_quota_exhausted`, regardless of `overage-fallback-enabled`. The plugin will never blindly route billable traffic to a credential whose quota status it has not actually confirmed; it only does so for a credential it has confirmed is genuinely over its five-hour limit.
 
+On a hard exhaustion, the scheduler returns `five_hour_quota_exhausted`. When it has a future known five-hour reset, it appends informational `retry_after_seconds` and `resets_at` metadata to that error message. This can help an explicit client wrapper decide when to retry, but the scheduler ABI cannot emit HTTP 429 or `Retry-After`, and OpenCode does not automatically honor this metadata without wrapper/client support.
+
 To restore strict hard-blocking once every account is exhausted (i.e. disable overage billing entirely), set:
 
 ```yaml
