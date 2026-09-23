@@ -219,6 +219,7 @@ func TestInterceptStreamChunkPayloadIsNoOpAndDoesNotUpdate(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 
 	for _, index := range []int{0, 1, 42} {
 		response := runtime.interceptStreamChunk(pluginapi.StreamChunkInterceptRequest{
@@ -234,6 +235,9 @@ func TestInterceptStreamChunkPayloadIsNoOpAndDoesNotUpdate(t *testing.T) {
 	}
 	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
 		t.Fatalf("payload chunk updated sample: %#v", sample)
+	}
+	if _, ok := runtime.selectedAuthForRequest("request-a"); !ok {
+		t.Fatal("payload chunk consumed valid correlation")
 	}
 }
 
@@ -295,10 +299,10 @@ func TestOlderHeaderObservationDoesNotOverwriteNewerSample(t *testing.T) {
 
 	newer := headerObservation{PercentUsed: 80, ObservedAt: now.Add(time.Second), Valid: true}
 	older := headerObservation{PercentUsed: 5, ObservedAt: now, Valid: true}
-	if !runtime.cache.recordHeaderObservation("auth-a", 0, 95, newer) {
+	if !runtime.cache.recordHeaderObservation("auth-a", 0, 1, 95, newer) {
 		t.Fatal("newer observation should commit")
 	}
-	if runtime.cache.recordHeaderObservation("auth-a", 0, 95, older) {
+	if runtime.cache.recordHeaderObservation("auth-a", 0, 1, 95, older) {
 		t.Fatal("older observation should not commit")
 	}
 	if sample := runtime.cache.snapshot("auth-a"); sample.FiveHourPercentUsed != 80 {
@@ -408,11 +412,8 @@ func TestResponseAndStreamChunkInterceptorABIDispatchNoOpOnMalformedPayload(t *t
 //
 // This is the most direct proof available without terminating real upstream
 // TLS in-process (see the header-observation report for why a full local
-// upstream-fixture e2e is infeasible here): the host is guaranteed by
-// sdk/cliproxy/auth/conductor_execution.go's publishSelectedAuthMetadata to
-// place selected_auth_id into this exact opts.Metadata map before Anthropic's
-// response reaches applyResponseInterceptors, which passes that same map
-// through unmodified as this request's Metadata field.
+// Response hook metadata is not relied on for selected_auth_id: CPA's
+// after-auth hook is the authoritative RequestID correlation point.
 func TestResponseInterceptorABIDispatchHostShapedRPCEnvelope(t *testing.T) {
 	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
@@ -532,6 +533,52 @@ func TestStaleCorrelationGenerationCannotPopulateReplacement(t *testing.T) {
 	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.9"}}})
 	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
 		t.Fatalf("stale response populated replacement: %#v", sample)
+	}
+}
+
+func TestStaleCorrelationRevisionIncarnationCannotPopulateReplacement(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	auth := physicalClaudeAuth{ID: "auth-a", Identity: "same"}
+	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	bound, ok := runtime.cache.bindRevision(auth, "old-revision", 0)
+	if !ok {
+		t.Fatal("bind old revision")
+	}
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
+	if _, ok := runtime.cache.bindRevision(bound, "new-revision", 0); !ok {
+		t.Fatal("bind new revision")
+	}
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.9"}}})
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("old revision response populated new revision: %#v", sample)
+	}
+}
+
+func TestStaleCorrelationRemoveReaddCannotPopulateReplacement(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
+	runtime.cache.reconcile(nil)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.9"}}})
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("remove/readd stale response populated auth: %#v", sample)
+	}
+}
+
+func TestUnsafeAfterAuthSupersedesPriorCorrelation(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
+	// Retry B is not a known safe cache member, so it must invalidate A's old
+	// RequestID correlation rather than leaving it available for the response.
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-b"})
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.5"}}})
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("unsafe retry let response update prior A: %#v", sample)
 	}
 }
 

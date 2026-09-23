@@ -41,7 +41,10 @@ type quotaSample struct {
 	// ObservedGeneration is bumped for every observed list-metadata change.
 	// It does not invalidate a committed sample, but makes older in-flight work
 	// ineligible to commit after a newer observation.
-	ObservedGeneration  uint64
+	ObservedGeneration uint64
+	// Incarnation is a monotonically allocated credential lifetime token. Unlike
+	// generation it is never reused after remove/re-add and changes on revision.
+	Incarnation         uint64
 	HasSample           bool
 	FiveHourPercentUsed float64
 	SampledAt           time.Time
@@ -101,8 +104,9 @@ func (s quotaSample) excluded(now time.Time, cutoff float64) bool {
 }
 
 type quotaCache struct {
-	mu      sync.Mutex
-	samples map[string]quotaSample
+	mu              sync.Mutex
+	samples         map[string]quotaSample
+	nextIncarnation uint64
 }
 
 // earliestFutureReset returns the earliest future reset from successful cache
@@ -176,8 +180,13 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) (map[string]struct{},
 		}
 		keep[auth.ID] = struct{}{}
 		sample := c.samples[auth.ID]
+		if sample.Incarnation == 0 {
+			c.nextIncarnation++
+			sample.Incarnation = c.nextIncarnation
+		}
 		if sample.Identity != "" && auth.Identity != "" && sample.Identity != auth.Identity {
-			sample = quotaSample{ObservedGeneration: sample.ObservedGeneration + 1}
+			c.nextIncarnation++
+			sample = quotaSample{ObservedGeneration: sample.ObservedGeneration + 1, Incarnation: c.nextIncarnation}
 			replaced[auth.ID] = struct{}{}
 		}
 		if sample.ListRevision != "" && auth.ListRevision != "" && sample.ListRevision != auth.ListRevision {
@@ -324,7 +333,8 @@ func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string, gene
 		return physicalClaudeAuth{}, false
 	}
 	if sample.Revision != "" && sample.Revision != revision {
-		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration}
+		c.nextIncarnation++
+		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration, Incarnation: c.nextIncarnation}
 	}
 	sample.Revision = revision
 	c.samples[auth.ID] = sample
@@ -410,7 +420,7 @@ func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generat
 // that; this method's own commit is unconditional on the current SampledAt
 // except that it never regresses an observation with a newer one already
 // recorded (compared by ObservedAt).
-func (c *quotaCache) recordHeaderObservation(authID string, generation uint64, cutoff float64, observation headerObservation) bool {
+func (c *quotaCache) recordHeaderObservation(authID string, generation, incarnation uint64, cutoff float64, observation headerObservation) bool {
 	authID = strings.TrimSpace(authID)
 	if authID == "" || !observation.Valid {
 		return false
@@ -418,7 +428,7 @@ func (c *quotaCache) recordHeaderObservation(authID string, generation uint64, c
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
-	if !ok || sample.ObservedGeneration != generation {
+	if !ok || sample.ObservedGeneration != generation || sample.Incarnation != incarnation {
 		return false
 	}
 	if observation.ResetAt.IsZero() && observation.PercentUsed >= cutoff {

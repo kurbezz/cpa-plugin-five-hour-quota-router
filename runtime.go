@@ -159,7 +159,7 @@ func (r *pluginRuntime) observeResponseHeaders(model, requestID string, headers 
 	if !observation.Valid {
 		return
 	}
-	if !r.cache.recordHeaderObservation(correlation.authID, correlation.generation, r.loadedConfig().CutoffPercentUsed, observation) {
+	if !r.cache.recordHeaderObservation(correlation.authID, correlation.generation, correlation.incarnation, r.loadedConfig().CutoffPercentUsed, observation) {
 		return
 	}
 	r.consumeSelectedAuth(requestID, correlation)
@@ -231,9 +231,10 @@ const (
 )
 
 type selectedAuthCorrelation struct {
-	authID     string
-	generation uint64
-	expiresAt  time.Time
+	authID      string
+	generation  uint64
+	incarnation uint64
+	expiresAt   time.Time
 }
 
 // discoverAuths reconciles a host.auth.list snapshot unless a later-issued
@@ -269,6 +270,13 @@ func (r *pluginRuntime) recordSelectedAuth(requestID string, metadata map[string
 	if r == nil || strings.TrimSpace(requestID) == "" {
 		return
 	}
+	// Each after-auth callback supersedes prior intent, including an unsafe
+	// retry that cannot be correlated to a current cache member.
+	r.selectedAuthMu.Lock()
+	if r.selectedAuths != nil {
+		delete(r.selectedAuths, requestID)
+	}
+	r.selectedAuthMu.Unlock()
 	authID, ok := selectedAuthIDFromMetadata(metadata)
 	if !ok {
 		return
@@ -298,7 +306,7 @@ func (r *pluginRuntime) recordSelectedAuth(requestID string, metadata map[string
 		}
 		delete(r.selectedAuths, oldestID)
 	}
-	r.selectedAuths[requestID] = selectedAuthCorrelation{authID: authID, generation: sample.ObservedGeneration, expiresAt: now.Add(selectedAuthCorrelationTTL)}
+	r.selectedAuths[requestID] = selectedAuthCorrelation{authID: authID, generation: sample.ObservedGeneration, incarnation: sample.Incarnation, expiresAt: now.Add(selectedAuthCorrelationTTL)}
 }
 
 func (r *pluginRuntime) selectedAuthForRequest(requestID string) (selectedAuthCorrelation, bool) {
