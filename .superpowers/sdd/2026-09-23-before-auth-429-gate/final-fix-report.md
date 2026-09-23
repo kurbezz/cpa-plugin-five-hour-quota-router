@@ -26,4 +26,4 @@
 - Retry delay is intentionally a small fixed per-ID delay and remains cancellation-aware. No credentials, auth JSON, revisions, or headers are logged.
 
 ## Commit
-Pending commit.
+ae8bffdd08b87b23f8dc9f1a0fe54d51a5e74a74 (followed by timing test commit)
