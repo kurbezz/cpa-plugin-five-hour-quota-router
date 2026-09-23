@@ -34,3 +34,10 @@ ae8bffdd08b87b23f8dc9f1a0fe54d51a5e74a74 (followed by timing test commit)
 - Added deterministic cancellation/restart-queue and overlap failure regressions.
 
 Additional validation after final review: `go build ./...`, `go vet ./...`, `go test ./...` (130), `go test -race ./...` (129), and `git diff --check` passed.
+
+## Targeted deferred-retry fix
+- Replaced worker-blocking revision throttle waits with worker-owned per-ID deferred deadlines. The refresh loop selects on wake, nearest deadline, and cancellation, then promotes due IDs atomically.
+- Deferred state is lifecycle-owned under `refreshMu`, cleared on stop, and preserves overlap revision intent without detached goroutines.
+- Added deterministic regression proving throttled revision A does not delay ready targeted usage B.
+
+Validation: `go build ./...`, `go vet ./...`, `go test ./...` (131), `go test -race ./...` (130), and `git diff --check` passed.

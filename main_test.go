@@ -1612,10 +1612,47 @@ func TestOverlapUsageAndRevisionGetFailureRetainsRevisionIntent(t *testing.T) {
 	// when the shared auth.get fails.
 	runtime.pollAuthWithRevisionIntent(context.Background(), auth, defaultPluginConfig(), false, true)
 	runtime.refreshMu.Lock()
-	_, queued := runtime.pendingRevisionIDs["auth-a"]
+	_, queued := runtime.deferredRevisionIDs["auth-a"]
 	runtime.refreshMu.Unlock()
 	if !queued {
 		t.Fatal("overlapping usage/revision auth.get failure lost revision retry")
+	}
+}
+
+func TestThrottledRevisionDoesNotDelayReadyTargetedUsage(t *testing.T) {
+	now := time.Now().UTC()
+	entryA := physicalEntry("auth-a", "index-a")
+	entryB := physicalEntry("auth-b", "index-b")
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+		"index-a": credentialJSON("token-a"), "index-b": credentialJSON("token-b"),
+	}}
+	bFetched := make(chan struct{})
+	runtime := newTestRuntime(host, func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
+		if token == "token-b" {
+			close(bFetched)
+		}
+		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
+	}, now)
+	runtime.wake = make(chan struct{}, 1)
+	auths := physicalClaudeAuths(host.entries)
+	runtime.cache.reconcile(auths)
+	if !runtime.cache.claimRevisionCheck("auth-a", now, time.Hour) {
+		t.Fatal("seed A revision throttle")
+	}
+	// A's deferred revision work returns immediately to the worker; B's ready
+	// targeted usage is not held behind A's throttle deadline.
+	runtime.checkAuthRevision(context.Background(), auths[0], defaultPluginConfig())
+	runtime.pollAuth(context.Background(), auths[1], defaultPluginConfig(), false)
+	select {
+	case <-bFetched:
+	case <-time.After(time.Second):
+		t.Fatal("ready B usage was delayed by throttled A revision")
+	}
+	runtime.refreshMu.Lock()
+	_, deferred := runtime.deferredRevisionIDs["auth-a"]
+	runtime.refreshMu.Unlock()
+	if !deferred {
+		t.Fatal("throttled A revision was not deferred")
 	}
 }
 

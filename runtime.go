@@ -128,8 +128,12 @@ type pluginRuntime struct {
 	pendingAll         bool
 	pendingIDs         map[string]struct{}
 	pendingRevisionIDs map[string]struct{}
-	inFlightAll        bool
-	inFlightIDs        map[string]struct{}
+	// deferredRevisionIDs is owned as lifecycle state under refreshMu. Delayed
+	// revision retries are promoted by refreshLoop's timer, never by detached
+	// goroutines, so an old runtime cannot enqueue into a restarted one.
+	deferredRevisionIDs map[string]time.Time
+	inFlightAll         bool
+	inFlightIDs         map[string]struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -207,6 +211,7 @@ func (r *pluginRuntime) stopLocked() {
 	r.pendingAll, r.inFlightAll = false, false
 	clear(r.pendingIDs)
 	clear(r.pendingRevisionIDs)
+	clear(r.deferredRevisionIDs)
 	clear(r.inFlightIDs)
 	r.refreshMu.Unlock()
 	r.log("info", "five-hour quota router refresh worker stopped", nil)
@@ -332,10 +337,24 @@ func (r *pluginRuntime) queueRevisionCheckLocked(authID string) {
 func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	for {
+		delay, hasDeferred := r.nextDeferredRevisionDelay()
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if hasDeferred {
+			timer = time.NewTimer(delay)
+			timerC = timer.C
+		}
 		select {
 		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		case <-wake:
+		case <-timerC:
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 		for {
 			all, authIDs, revisionIDs := r.takePendingRefresh()
@@ -357,6 +376,16 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, d
 func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}, map[string]struct{}) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
+	now := r.now()
+	for authID, due := range r.deferredRevisionIDs {
+		if !now.Before(due) {
+			if r.pendingRevisionIDs == nil {
+				r.pendingRevisionIDs = make(map[string]struct{})
+			}
+			r.pendingRevisionIDs[authID] = struct{}{}
+			delete(r.deferredRevisionIDs, authID)
+		}
+	}
 	if r.pendingAll {
 		r.pendingAll = false
 		clear(r.pendingIDs)
@@ -377,6 +406,25 @@ func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}, map[str
 		r.inFlightIDs[authID] = struct{}{}
 	}
 	return false, authIDs, revisionIDs
+}
+
+func (r *pluginRuntime) nextDeferredRevisionDelay() (time.Duration, bool) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	var earliest time.Time
+	for _, due := range r.deferredRevisionIDs {
+		if earliest.IsZero() || due.Before(earliest) {
+			earliest = due
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	delay := earliest.Sub(r.now())
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
 }
 
 func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
@@ -445,17 +493,27 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 // discovery/read failure. It is per-ID, bounded and cancellation-aware; it
 // never turns metadata handling into a fleet poll.
 func (r *pluginRuntime) retryRevisionCheck(ctx context.Context, authID string) {
-	// This runs on the sole refresh worker, rather than in a detached timer
-	// goroutine. Consequently shutdown cancellation interrupts the wait and an
-	// old lifecycle can never enqueue work into a later worker lifecycle.
-	const delay = 25 * time.Millisecond
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return
-	case <-timer.C:
-		r.queueRevisionCheckFromWorker(authID)
+	}
+	r.deferRevisionCheckFromWorker(authID, r.now().Add(25*time.Millisecond))
+}
+
+func (r *pluginRuntime) deferRevisionCheckFromWorker(authID string, due time.Time) {
+	r.refreshMu.Lock()
+	if r.deferredRevisionIDs == nil {
+		r.deferredRevisionIDs = make(map[string]time.Time)
+	}
+	if old, exists := r.deferredRevisionIDs[authID]; !exists || due.Before(old) {
+		r.deferredRevisionIDs[authID] = due
+	}
+	wake := r.wake
+	r.refreshMu.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -464,16 +522,9 @@ func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClau
 		// Preserve detection until the throttle window elapses without spinning
 		// the worker or widening this per-ID check into a fleet refresh.
 		delay := r.cache.revisionCheckDelay(auth.ID, r.now(), cfg.PollInterval)
-		if delay > 0 {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return
-			case <-timer.C:
-			}
+		if ctx.Err() == nil {
+			r.deferRevisionCheckFromWorker(auth.ID, r.now().Add(delay))
 		}
-		r.queueRevisionCheckFromWorker(auth.ID)
 		return
 	}
 	r.pollAuth(ctx, auth, cfg, true)
