@@ -277,7 +277,7 @@ func TestInterceptBeforeAuthQueuesRefreshForIdentityInvalidation(t *testing.T) {
 	waitFor(t, func() bool { listCalls, _ := host.counts(); return listCalls > 0 })
 
 	old := physicalEntry("auth-a", "index-old")
-	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{old}))
+	_, _ = runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{old}))
 	runtime.cache.recordSuccess("auth-a", 99, now.Add(time.Hour), now)
 	newEntry := physicalEntry("auth-a", "index-new")
 	newEntry.Path = "/fixtures/replaced-auth-a.json"
@@ -1381,7 +1381,7 @@ func TestCachePrunesRemovedAuths(t *testing.T) {
 		getErrors: map[string]error{"index-a": errors.New("fixture read failure")},
 	}
 	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
-	runtime.cache.reconcile([]physicalClaudeAuth{
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{
 		{ID: "auth-a", AuthIndex: "index-a"},
 		{ID: "removed", AuthIndex: "removed-index"},
 	})
@@ -1405,7 +1405,7 @@ func TestCredentialReplacementClearsStaleBlock(t *testing.T) {
 		getErrors: map[string]error{"index-a": errors.New("fixture read failure")},
 	}
 	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
-	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{oldEntry}))
+	_, _ = runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{oldEntry}))
 	runtime.cache.recordSuccess("auth-a", 80, now.Add(time.Hour), now.Add(-time.Minute))
 	runtime.pollOnce(context.Background(), defaultPluginConfig())
 	sample := runtime.cache.snapshot("auth-a")
@@ -1446,7 +1446,7 @@ func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
 	}
 	runtime := newTestRuntime(host, fetch, now)
-	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{oldEntry}))
+	_, _ = runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{oldEntry}))
 	runtime.cache.recordSuccess("auth-b", 80, now.Add(time.Hour), now.Add(-time.Minute))
 	done := make(chan struct{})
 	go func() {
@@ -1480,7 +1480,7 @@ func TestMetadataOnlyAuthUpdatePreservesCredentialRevisionAndSample(t *testing.T
 	entry := physicalEntry("auth-a", "index-a")
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
-	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{auth})
 	bound, ok := runtime.cache.bindRevision(auth, claudeCredentialRevision(claudeCredential{AccessToken: "token-a"}))
 	if !ok {
 		t.Fatal("bind initial revision")
@@ -1489,7 +1489,7 @@ func TestMetadataOnlyAuthUpdatePreservesCredentialRevisionAndSample(t *testing.T
 
 	entry.Size = 12345
 	entry.ModTime = now.Add(time.Minute)
-	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry}))
+	_, _ = runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry}))
 	sample := runtime.cache.snapshot("auth-a")
 	if !sample.HasSample || !sample.blocked(now, 95) {
 		t.Fatalf("metadata-only update cleared confirmed sample: %#v", sample)
@@ -1530,7 +1530,7 @@ func TestSamePathCredentialReplacementInvalidatesAndRejectsOldInFlightResult(t *
 	}
 	runtime := newTestRuntime(host, fetch, now)
 	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
-	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{auth})
 
 	doneOld := make(chan struct{})
 	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig()); close(doneOld) }()
@@ -1554,6 +1554,43 @@ func TestSamePathCredentialReplacementInvalidatesAndRejectsOldInFlightResult(t *
 	sample := runtime.cache.snapshot("auth-a")
 	if !sample.HasSample || sample.FiveHourPercentUsed != 10 {
 		t.Fatalf("replacement sample = %#v", sample)
+	}
+}
+
+func TestBlockedSamePathReplacementMetadataChangeQueuesRevisionCheck(t *testing.T) {
+	now := time.Now().UTC()
+	entry := physicalEntry("auth-a", "index-a")
+	entry.Path, entry.Email = "/fixtures/same-path.json", ""
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entry}, authJSON: map[string]json.RawMessage{"index-a": credentialJSON("old-token")}}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"old-token": {{result: usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}}},
+		"new-token": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+	}}
+	runtime := newTestRuntime(host, fetcher.fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled, cfg.PollInterval = false, time.Nanosecond
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool { return runtime.cache.snapshot("auth-a").HasSample })
+	if !runtime.cache.snapshot("auth-a").blocked(now, cfg.CutoffPercentUsed) {
+		t.Fatal("initial old credential is not blocked")
+	}
+
+	host.mu.Lock()
+	host.authJSON["index-a"] = credentialJSON("new-token")
+	updated := host.entries[0]
+	updated.ModTime = updated.ModTime.Add(time.Second)
+	host.entries[0] = updated
+	host.mu.Unlock()
+	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); !response.Terminate {
+		t.Fatalf("old confirmed sample should gate while async revision check starts: %#v", response)
+	}
+	waitFor(t, func() bool {
+		sample := runtime.cache.snapshot("auth-a")
+		return sample.HasSample && sample.FiveHourPercentUsed == 10
+	})
+	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
+		t.Fatalf("replacement recovery remained gated: %#v", response)
 	}
 }
 
@@ -1812,7 +1849,7 @@ func TestSchedulerPickPerformsNoHTTPOrAuthCallbacks(t *testing.T) {
 func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, (&fakeFetcher{}).fetch, now)
-	runtime.cache.reconcile([]physicalClaudeAuth{
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{
 		{ID: "auth-a", AuthIndex: "index-a", Name: "claude-a.json"},
 		{ID: "auth-b", AuthIndex: "index-b", Name: "claude-b.json"},
 	})
@@ -1876,7 +1913,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 func TestManagementStatusExpiresStaleBlockedSample(t *testing.T) {
 	now := time.Date(2026, time.July, 24, 12, 0, 0, 0, time.UTC)
 	runtime := newTestRuntime(&fakeHost{}, (&fakeFetcher{}).fetch, now)
-	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", AuthIndex: "index-a", Name: "claude-a.json"}})
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", AuthIndex: "index-a", Name: "claude-a.json"}})
 	runtime.cache.recordSuccess("auth-a", 75, now.Add(-time.Second), now.Add(-time.Hour))
 	runtime.cache.recordFailure("auth-a", pollErrorRateLimited)
 

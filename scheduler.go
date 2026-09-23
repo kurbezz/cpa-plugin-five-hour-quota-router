@@ -36,11 +36,12 @@ func candidateWeight(candidate *pluginapi.SchedulerAuthCandidate) int64 {
 }
 
 type physicalClaudeAuth struct {
-	ID        string
-	AuthIndex string
-	Name      string
-	Identity  string
-	Revision  string
+	ID           string
+	AuthIndex    string
+	Name         string
+	Identity     string
+	Revision     string
+	ListRevision string
 }
 
 func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaudeAuth {
@@ -58,14 +59,21 @@ func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaude
 			continue
 		}
 		auths = append(auths, physicalClaudeAuth{
-			ID:        entry.ID,
-			AuthIndex: entry.AuthIndex,
-			Name:      strings.TrimSpace(entry.Name),
-			Identity:  physicalAuthIdentity(entry),
+			ID:           entry.ID,
+			AuthIndex:    entry.AuthIndex,
+			Name:         strings.TrimSpace(entry.Name),
+			Identity:     physicalAuthIdentity(entry),
+			ListRevision: physicalAuthListRevision(entry),
 		})
 	}
 	sort.Slice(auths, func(i, j int) bool { return auths[i].ID < auths[j].ID })
 	return auths
+}
+
+// physicalAuthListRevision is only a non-secret change signal used to schedule
+// an asynchronous credential revision check. It is deliberately not identity.
+func physicalAuthListRevision(entry pluginapi.HostAuthFileEntry) string {
+	return fmt.Sprintf("file:%d:%d", entry.Size, entry.ModTime.UnixNano())
 }
 
 func physicalAuthIdentity(entry pluginapi.HostAuthFileEntry) string {

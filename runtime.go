@@ -41,7 +41,7 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		return pluginapi.RequestInterceptResponse{}
 	}
 	auths := physicalClaudeAuths(entries)
-	replaced := r.cache.reconcile(auths)
+	replaced, changed := r.cache.reconcile(auths)
 	authIDs := make([]string, 0, len(auths))
 	needsReplacementRefresh := false
 	for _, auth := range auths {
@@ -55,6 +55,11 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 			} else {
 				r.queueCandidateRefresh(auth.ID, cfg, r.now())
 			}
+		}
+		if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged && r.cache.claimRevisionCheck(auth.ID, r.now(), cfg.PollInterval) {
+			// List metadata is merely a hint. Check the credential revision off the
+			// request path, including while its old quota sample is blocked.
+			needsReplacementRefresh = true
 		}
 	}
 	if needsReplacementRefresh {
@@ -154,7 +159,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 	r.config.Store(&cfg)
 	if !cfg.Enabled {
 		r.stopLocked()
-		r.cache.reconcile(nil)
+		_, _ = r.cache.reconcile(nil)
 		return
 	}
 	if r.cancel == nil {
@@ -357,7 +362,7 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 		return
 	}
 	auths := physicalClaudeAuths(entries)
-	r.cache.reconcile(auths)
+	_, _ = r.cache.reconcile(auths)
 	for _, auth := range auths {
 		if ctx.Err() != nil {
 			return

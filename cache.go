@@ -35,6 +35,8 @@ type quotaSample struct {
 	// Revision is a non-reversible digest derived asynchronously from the
 	// credential JSON. It is intentionally never included in status or logs.
 	Revision            string
+	ListRevision        string
+	LastRevisionCheckAt time.Time
 	HasSample           bool
 	FiveHourPercentUsed float64
 	SampledAt           time.Time
@@ -132,9 +134,10 @@ func (c *quotaCache) empty() bool {
 
 // reconcile updates membership and returns IDs invalidated by a physical
 // identity replacement under the same auth ID.
-func (c *quotaCache) reconcile(auths []physicalClaudeAuth) map[string]struct{} {
+func (c *quotaCache) reconcile(auths []physicalClaudeAuth) (map[string]struct{}, map[string]struct{}) {
 	keep := make(map[string]struct{}, len(auths))
 	replaced := make(map[string]struct{})
+	changed := make(map[string]struct{})
 	c.mu.Lock()
 	for _, auth := range auths {
 		if strings.TrimSpace(auth.ID) == "" {
@@ -146,9 +149,13 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) map[string]struct{} {
 			sample = quotaSample{}
 			replaced[auth.ID] = struct{}{}
 		}
+		if sample.ListRevision != "" && auth.ListRevision != "" && sample.ListRevision != auth.ListRevision {
+			changed[auth.ID] = struct{}{}
+		}
 		sample.AuthIndex = auth.AuthIndex
 		sample.Name = strings.TrimSpace(auth.Name)
 		sample.Identity = auth.Identity
+		sample.ListRevision = auth.ListRevision
 		c.samples[auth.ID] = sample
 	}
 	for authID := range c.samples {
@@ -157,7 +164,21 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) map[string]struct{} {
 		}
 	}
 	c.mu.Unlock()
-	return replaced
+	return replaced, changed
+}
+
+// claimRevisionCheck throttles an asynchronous auth.get revision check even
+// when the quota sample is blocked. It never clears a sample itself.
+func (c *quotaCache) claimRevisionCheck(authID string, now time.Time, minimumAge time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[authID]
+	if !ok || (!sample.LastRevisionCheckAt.IsZero() && now.Before(sample.LastRevisionCheckAt.Add(minimumAge))) {
+		return false
+	}
+	sample.LastRevisionCheckAt = now
+	c.samples[authID] = sample
+	return true
 }
 
 func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
