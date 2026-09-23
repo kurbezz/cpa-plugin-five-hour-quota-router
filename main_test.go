@@ -1533,13 +1533,13 @@ func TestSamePathCredentialReplacementInvalidatesAndRejectsOldInFlightResult(t *
 	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{auth})
 
 	doneOld := make(chan struct{})
-	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig()); close(doneOld) }()
+	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig(), false); close(doneOld) }()
 	<-oldFetchStarted
 	host.mu.Lock()
 	host.authJSON["index-a"] = credentialJSON("new-token")
 	host.mu.Unlock()
 	doneNew := make(chan struct{})
-	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig()); close(doneNew) }()
+	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig(), false); close(doneNew) }()
 	<-newFetchStarted
 	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
 		t.Fatalf("same-path replacement retained old sample: %#v", sample)
@@ -1591,6 +1591,54 @@ func TestBlockedSamePathReplacementMetadataChangeQueuesRevisionCheck(t *testing.
 	})
 	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
 		t.Fatalf("replacement recovery remained gated: %#v", response)
+	}
+}
+
+func TestRevisionSignalInsideThrottleIsRetainedAndTargetsOnlyChangedAuth(t *testing.T) {
+	now := time.Now().UTC()
+	entryA := physicalEntry("auth-a", "index-a")
+	entryA.Path, entryA.Email = "/fixtures/a.json", ""
+	entryB := physicalEntry("auth-b", "index-b")
+	entryB.Path, entryB.Email = "/fixtures/b.json", ""
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entryA, entryB}, authJSON: map[string]json.RawMessage{
+		"index-a": credentialJSON("old-a"), "index-b": credentialJSON("token-b"),
+	}}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"old-a":   {{result: usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}}},
+		"new-a":   {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+		"token-b": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+	}}
+	runtime := newPluginRuntime(host, fetcher.fetch, time.Now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled, cfg.PollInterval = false, 30*time.Millisecond
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool {
+		return runtime.cache.snapshot("auth-a").HasSample && runtime.cache.snapshot("auth-b").HasSample
+	})
+	if !runtime.cache.claimRevisionCheck("auth-a", time.Now(), cfg.PollInterval) {
+		t.Fatal("seed revision throttle")
+	}
+	host.mu.Lock()
+	host.authJSON["index-a"] = credentialJSON("new-a")
+	updated := host.entries[0]
+	updated.ModTime = updated.ModTime.Add(time.Second)
+	host.entries[0] = updated
+	host.mu.Unlock()
+	_ = runtime.interceptBeforeAuth(beforeAuthRequest())
+	waitFor(t, func() bool {
+		sample := runtime.cache.snapshot("auth-a")
+		return sample.HasSample && sample.FiveHourPercentUsed == 10
+	})
+	got := fetcher.callTokens()
+	bCalls := 0
+	for _, token := range got {
+		if token == "token-b" {
+			bCalls++
+		}
+	}
+	if bCalls != 1 {
+		t.Fatalf("unrelated auth received usage refreshes: calls=%#v", got)
 	}
 }
 

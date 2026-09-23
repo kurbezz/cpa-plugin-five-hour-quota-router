@@ -43,7 +43,6 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 	auths := physicalClaudeAuths(entries)
 	replaced, changed := r.cache.reconcile(auths)
 	authIDs := make([]string, 0, len(auths))
-	needsReplacementRefresh := false
 	for _, auth := range auths {
 		authIDs = append(authIDs, auth.ID)
 		// Ordinary unknowns retain normal per-ID throttle behavior. A replaced
@@ -51,21 +50,16 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		// poll sharing the same ID.
 		if !r.cache.snapshot(auth.ID).HasSample {
 			if _, wasReplaced := replaced[auth.ID]; wasReplaced {
-				needsReplacementRefresh = true
+				r.queueRevisionCheck(auth.ID)
 			} else {
 				r.queueCandidateRefresh(auth.ID, cfg, r.now())
 			}
 		}
-		if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged && r.cache.claimRevisionCheck(auth.ID, r.now(), cfg.PollInterval) {
+		if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged {
 			// List metadata is merely a hint. Check the credential revision off the
 			// request path, including while its old quota sample is blocked.
-			needsReplacementRefresh = true
+			r.queueRevisionCheck(auth.ID)
 		}
-	}
-	if needsReplacementRefresh {
-		// A full queued pass remains pending even if a prior pass is currently
-		// in flight, guaranteeing a replacement identity gets a follow-up poll.
-		r.queueAllRefresh()
 	}
 	now := r.now()
 	if !r.cache.allConfirmedExhausted(authIDs, now, cfg.CutoffPercentUsed) {
@@ -120,20 +114,21 @@ type claudeCredential struct {
 }
 
 type pluginRuntime struct {
-	lifecycleMu sync.Mutex
-	refreshMu   sync.Mutex
-	config      atomic.Pointer[pluginConfig]
-	cache       quotaCache
-	host        hostClient
-	fetch       usageFetcher
-	now         func() time.Time
-	wake        chan struct{}
-	cancel      context.CancelFunc
-	done        chan struct{}
-	pendingAll  bool
-	pendingIDs  map[string]struct{}
-	inFlightAll bool
-	inFlightIDs map[string]struct{}
+	lifecycleMu        sync.Mutex
+	refreshMu          sync.Mutex
+	config             atomic.Pointer[pluginConfig]
+	cache              quotaCache
+	host               hostClient
+	fetch              usageFetcher
+	now                func() time.Time
+	wake               chan struct{}
+	cancel             context.CancelFunc
+	done               chan struct{}
+	pendingAll         bool
+	pendingIDs         map[string]struct{}
+	pendingRevisionIDs map[string]struct{}
+	inFlightAll        bool
+	inFlightIDs        map[string]struct{}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -210,6 +205,7 @@ func (r *pluginRuntime) stopLocked() {
 	r.refreshMu.Lock()
 	r.pendingAll, r.inFlightAll = false, false
 	clear(r.pendingIDs)
+	clear(r.pendingRevisionIDs)
 	clear(r.inFlightIDs)
 	r.refreshMu.Unlock()
 	r.log("info", "five-hour quota router refresh worker stopped", nil)
@@ -288,6 +284,32 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 	}
 }
 
+// queueRevisionCheck records detection durably per ID. Throttling occurs when
+// the worker executes the check, so a metadata signal received inside the
+// throttle window is not lost.
+func (r *pluginRuntime) queueRevisionCheck(authID string) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
+		return
+	}
+	r.refreshMu.Lock()
+	if r.pendingRevisionIDs == nil {
+		r.pendingRevisionIDs = make(map[string]struct{})
+	}
+	r.pendingRevisionIDs[authID] = struct{}{}
+	wake := r.wake
+	r.refreshMu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
 func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	for {
@@ -297,13 +319,13 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, d
 		case <-wake:
 		}
 		for {
-			all, authIDs := r.takePendingRefresh()
-			if !all && len(authIDs) == 0 {
+			all, authIDs, revisionIDs := r.takePendingRefresh()
+			if !all && len(authIDs) == 0 && len(revisionIDs) == 0 {
 				break
 			}
 			cfg := r.loadedConfig()
 			if cfg.Enabled {
-				r.refreshAuths(ctx, cfg, all, authIDs)
+				r.refreshAuths(ctx, cfg, all, authIDs, revisionIDs)
 			}
 			r.finishRefresh(all, authIDs)
 			if ctx.Err() != nil {
@@ -313,27 +335,29 @@ func (r *pluginRuntime) refreshLoop(ctx context.Context, wake <-chan struct{}, d
 	}
 }
 
-func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}) {
+func (r *pluginRuntime) takePendingRefresh() (bool, map[string]struct{}, map[string]struct{}) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
 	if r.pendingAll {
 		r.pendingAll = false
 		clear(r.pendingIDs)
 		r.inFlightAll = true
-		return true, nil
+		return true, nil, nil
 	}
-	if len(r.pendingIDs) == 0 {
-		return false, nil
+	if len(r.pendingIDs) == 0 && len(r.pendingRevisionIDs) == 0 {
+		return false, nil, nil
 	}
 	authIDs := r.pendingIDs
 	r.pendingIDs = make(map[string]struct{})
+	revisionIDs := r.pendingRevisionIDs
+	r.pendingRevisionIDs = make(map[string]struct{})
 	if r.inFlightIDs == nil {
 		r.inFlightIDs = make(map[string]struct{}, len(authIDs))
 	}
 	for authID := range authIDs {
 		r.inFlightIDs[authID] = struct{}{}
 	}
-	return false, authIDs
+	return false, authIDs, revisionIDs
 }
 
 func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
@@ -349,10 +373,10 @@ func (r *pluginRuntime) finishRefresh(all bool, authIDs map[string]struct{}) {
 }
 
 func (r *pluginRuntime) pollOnce(ctx context.Context, cfg pluginConfig) {
-	r.refreshAuths(ctx, cfg, true, nil)
+	r.refreshAuths(ctx, cfg, true, nil, nil)
 }
 
-func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all bool, authIDs map[string]struct{}) {
+func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all bool, authIDs, revisionIDs map[string]struct{}) {
 	if r == nil || r.host == nil || r.fetch == nil || ctx.Err() != nil {
 		return
 	}
@@ -368,15 +392,37 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 			return
 		}
 		if !all {
-			if _, selected := authIDs[auth.ID]; !selected {
+			_, selected := authIDs[auth.ID]
+			_, revisionCheck := revisionIDs[auth.ID]
+			if !selected && !revisionCheck {
+				continue
+			}
+			if revisionCheck && !selected {
+				r.checkAuthRevision(ctx, auth, cfg)
 				continue
 			}
 		}
-		r.pollAuth(ctx, auth, cfg)
+		r.pollAuth(ctx, auth, cfg, false)
 	}
 }
 
-func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
+func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
+	if !r.cache.claimRevisionCheck(auth.ID, r.now(), cfg.PollInterval) {
+		// Preserve detection until the throttle window elapses without spinning
+		// the worker or widening this per-ID check into a fleet refresh.
+		delay := r.cache.revisionCheckDelay(auth.ID, r.now(), cfg.PollInterval)
+		go func() {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			r.queueRevisionCheck(auth.ID)
+		}()
+		return
+	}
+	r.pollAuth(ctx, auth, cfg, true)
+}
+
+func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig, revisionCheck bool) {
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
@@ -395,6 +441,9 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	revision := claudeCredentialRevision(credential)
 	auth, ok := r.cache.bindRevision(auth, revision)
 	if !ok || !r.cache.recordAttemptForIdentity(auth, r.now()) {
+		return
+	}
+	if revisionCheck && !r.cache.shouldRefreshAfterRevisionCheck(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.PollInterval) {
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)

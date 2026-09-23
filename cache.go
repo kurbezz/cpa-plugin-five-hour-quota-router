@@ -181,6 +181,40 @@ func (c *quotaCache) claimRevisionCheck(authID string, now time.Time, minimumAge
 	return true
 }
 
+func (c *quotaCache) revisionCheckDelay(authID string, now time.Time, minimumAge time.Duration) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[authID]
+	if !ok || sample.LastRevisionCheckAt.IsZero() {
+		return 0
+	}
+	delay := sample.LastRevisionCheckAt.Add(minimumAge).Sub(now)
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+// shouldRefreshAfterRevisionCheck permits usage only for a changed revision or
+// when normal refresh eligibility allows it. bindRevision clears HasSample on
+// change, which makes this true for a replacement.
+func (c *quotaCache) shouldRefreshAfterRevisionCheck(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[authID]
+	if !ok || !sample.HasSample {
+		return true
+	}
+	if sample.blocked(now, cutoff) {
+		return false
+	}
+	last := sample.SampledAt
+	if sample.LastAttemptAt.After(last) {
+		last = sample.LastAttemptAt
+	}
+	return last.IsZero() || !now.Before(last.Add(minimumAge))
+}
+
 func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
 	if strings.TrimSpace(authID) == "" {
 		return false
