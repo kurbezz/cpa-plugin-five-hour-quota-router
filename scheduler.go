@@ -68,13 +68,15 @@ func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaude
 }
 
 func physicalAuthIdentity(entry pluginapi.HostAuthFileEntry) string {
-	return fmt.Sprintf("index:%q|path:%q|account:%q|email:%q|file:%d:%d",
+	// File metadata intentionally is not identity: CPA can update an auth file
+	// after an ordinary request without replacing its credential. A metadata-only
+	// change must not erase a confirmed quota sample and bypass before-auth
+	// admission.
+	return fmt.Sprintf("index:%q|path:%q|account:%q|email:%q",
 		entry.AuthIndex,
 		entry.Path,
 		strings.TrimSpace(entry.Account),
 		strings.ToLower(strings.TrimSpace(entry.Email)),
-		entry.Size,
-		entry.ModTime.UnixNano(),
 	)
 }
 

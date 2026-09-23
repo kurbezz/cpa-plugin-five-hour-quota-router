@@ -1417,9 +1417,9 @@ func TestCredentialReplacementClearsStaleBlock(t *testing.T) {
 func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 	now := time.Now().UTC()
 	oldEntry := physicalEntry("auth-b", "index-b")
-	oldEntry.ModTime = now.Add(-time.Hour)
+	oldEntry.Path = "/fixtures/auth-b-old.json"
 	newEntry := physicalEntry("auth-b", "index-b")
-	newEntry.ModTime = now
+	newEntry.Path = "/fixtures/auth-b-new.json"
 	host := &fakeHost{
 		entries: []pluginapi.HostAuthFileEntry{
 			physicalEntry("auth-a", "index-a"),
@@ -1459,7 +1459,7 @@ func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 		t.Fatal("first credential was not polled")
 	}
 	// Credential replacement is detected on reconcile (identity changed via
-	// ModTime), which clears the stale sample before the fresh poll for
+	// backing-file path), which clears the stale sample before the fresh poll for
 	// auth-b runs. Under fail-closed semantics, that means auth-b is
 	// excluded from scheduling until its own poll completes, even though
 	// auth-a's slower poll is still in flight.
