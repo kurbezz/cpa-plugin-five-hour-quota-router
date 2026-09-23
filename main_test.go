@@ -307,6 +307,8 @@ func TestInterceptBeforeAuthReplacementIgnoresInFlightOldIdentity(t *testing.T) 
 	}
 	oldFetchStarted := make(chan struct{})
 	releaseOldFetch := make(chan struct{})
+	newFetchStarted := make(chan struct{})
+	releaseNewFetch := make(chan struct{})
 	var fetchMu sync.Mutex
 	var fetches []string
 	fetch := func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
@@ -318,6 +320,8 @@ func TestInterceptBeforeAuthReplacementIgnoresInFlightOldIdentity(t *testing.T) 
 			<-releaseOldFetch
 			return usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}, ""
 		}
+		close(newFetchStarted)
+		<-releaseNewFetch
 		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
 	}
 	runtime := newTestRuntime(host, fetch, now)
@@ -336,12 +340,19 @@ func TestInterceptBeforeAuthReplacementIgnoresInFlightOldIdentity(t *testing.T) 
 		t.Fatalf("replacement was gated: %#v", response)
 	}
 	close(releaseOldFetch)
+	<-newFetchStarted
+	if sample := runtime.cache.snapshot("auth-a"); sample.Identity != physicalAuthIdentity(newEntry) || sample.HasSample {
+		t.Fatalf("stale A result committed into B before B completed: %#v", sample)
+	}
+	close(releaseNewFetch)
 
-	waitFor(t, func() bool {
-		fetchMu.Lock()
-		defer fetchMu.Unlock()
-		return len(fetches) == 2 && fetches[0] == "old-token" && fetches[1] == "new-token"
-	})
+	waitFor(t, func() bool { return runtime.cache.snapshot("auth-a").HasSample })
+	fetchMu.Lock()
+	gotFetches := append([]string(nil), fetches...)
+	fetchMu.Unlock()
+	if len(gotFetches) != 2 || gotFetches[0] != "old-token" || gotFetches[1] != "new-token" {
+		t.Fatalf("fetches = %#v", gotFetches)
+	}
 	if sample := runtime.cache.snapshot("auth-a"); sample.Identity != physicalAuthIdentity(newEntry) || !sample.HasSample || sample.FiveHourPercentUsed != 10 {
 		t.Fatalf("replacement sample = %#v", sample)
 	}

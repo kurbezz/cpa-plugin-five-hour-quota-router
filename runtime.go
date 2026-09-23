@@ -39,20 +39,23 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		return pluginapi.RequestInterceptResponse{}
 	}
 	auths := physicalClaudeAuths(entries)
-	r.cache.reconcile(auths)
+	replaced := r.cache.reconcile(auths)
 	authIDs := make([]string, 0, len(auths))
-	needsRefresh := false
+	needsReplacementRefresh := false
 	for _, auth := range auths {
 		authIDs = append(authIDs, auth.ID)
-		// Reconciliation can have just added a credential or invalidated a
-		// reused ID after its physical identity changed. Request an asynchronous
-		// refresh so that unknown state is temporary, while keeping this callback
-		// free of auth.get and usage HTTP work.
+		// Ordinary unknowns retain normal per-ID throttle behavior. A replaced
+		// identity needs a full pass that remains pending behind an old in-flight
+		// poll sharing the same ID.
 		if !r.cache.snapshot(auth.ID).HasSample {
-			needsRefresh = true
+			if _, wasReplaced := replaced[auth.ID]; wasReplaced {
+				needsReplacementRefresh = true
+			} else {
+				r.queueCandidateRefresh(auth.ID, cfg, r.now())
+			}
 		}
 	}
-	if needsRefresh {
+	if needsReplacementRefresh {
 		// A full queued pass remains pending even if a prior pass is currently
 		// in flight, guaranteeing a replacement identity gets a follow-up poll.
 		r.queueAllRefresh()

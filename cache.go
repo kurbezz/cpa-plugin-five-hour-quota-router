@@ -127,8 +127,11 @@ func (c *quotaCache) empty() bool {
 	return len(c.samples) == 0
 }
 
-func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
+// reconcile updates membership and returns IDs invalidated by a physical
+// identity replacement under the same auth ID.
+func (c *quotaCache) reconcile(auths []physicalClaudeAuth) map[string]struct{} {
 	keep := make(map[string]struct{}, len(auths))
+	replaced := make(map[string]struct{})
 	c.mu.Lock()
 	for _, auth := range auths {
 		if strings.TrimSpace(auth.ID) == "" {
@@ -138,6 +141,7 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 		sample := c.samples[auth.ID]
 		if sample.Identity != "" && auth.Identity != "" && sample.Identity != auth.Identity {
 			sample = quotaSample{}
+			replaced[auth.ID] = struct{}{}
 		}
 		sample.AuthIndex = auth.AuthIndex
 		sample.Name = strings.TrimSpace(auth.Name)
@@ -150,6 +154,7 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) {
 		}
 	}
 	c.mu.Unlock()
+	return replaced
 }
 
 func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
