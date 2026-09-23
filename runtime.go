@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,77 @@ type hostClient interface {
 	listAuth() ([]pluginapi.HostAuthFileEntry, error)
 	getAuth(authIndex string) (json.RawMessage, error)
 	log(level, message string, fields map[string]any)
+}
+
+// interceptBeforeAuth provides the narrow, fail-open HTTP admission gate used
+// before an upstream credential is selected. The request-interceptor SDK shape
+// intentionally has no Provider field at this lifecycle point, so Claude is
+// identified from the model name for the default all-Claude configuration; an
+// explicitly configured protected model remains an exact match.
+func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
+	cfg := r.loadedConfig()
+	if !cfg.Enabled || cfg.OverageFallbackEnabled || !isBeforeAuthProtectedClaudeRequest(req, cfg.ProtectedModels) || r.host == nil {
+		return pluginapi.RequestInterceptResponse{}
+	}
+
+	// Membership discovery is the only synchronous host operation here. A
+	// failure must not turn an uncertain credential set into a broad HTTP gate.
+	entries, err := r.host.listAuth()
+	if err != nil {
+		r.log("warn", "five-hour quota router before-auth membership discovery failed", map[string]any{"category": "auth_list"})
+		return pluginapi.RequestInterceptResponse{}
+	}
+	auths := physicalClaudeAuths(entries)
+	r.cache.reconcile(auths)
+	authIDs := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		authIDs = append(authIDs, auth.ID)
+	}
+	now := r.now()
+	if !r.cache.allConfirmedExhausted(authIDs, now, cfg.CutoffPercentUsed) {
+		return pluginapi.RequestInterceptResponse{}
+	}
+
+	resetAt, hasReset := r.cache.earliestFutureReset(authIDs, now)
+	body, err := json.Marshal(struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, resetAt, hasReset)})
+	if err != nil {
+		// This body is composed exclusively from fixed code and safe reset metadata,
+		// but preserve admission fail-open behavior if marshaling ever changes.
+		return pluginapi.RequestInterceptResponse{}
+	}
+	response := pluginapi.RequestInterceptResponse{
+		Terminate:  true,
+		StatusCode: http.StatusTooManyRequests,
+		ResponseHeaders: http.Header{
+			"Content-Type": []string{"application/json; charset=utf-8"},
+		},
+		ResponseBody: body,
+	}
+	if hasReset && now.Before(resetAt) {
+		retryAfterSeconds := int64(math.Ceil(resetAt.Sub(now).Seconds()))
+		if retryAfterSeconds < 1 {
+			retryAfterSeconds = 1
+		}
+		response.ResponseHeaders.Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
+	}
+	return response
+}
+
+func isBeforeAuthProtectedClaudeRequest(req pluginapi.RequestInterceptRequest, protectedModels []string) bool {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = strings.TrimSpace(req.RequestedModel)
+	}
+	if !isProtectedModel(model, protectedModels) {
+		return false
+	}
+	if len(protectedModels) > 0 {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(model), "claude")
 }
 
 type claudeCredential struct {
@@ -58,6 +132,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 
+	previous := r.loadedConfig()
 	r.config.Store(&cfg)
 	if !cfg.Enabled {
 		r.stopLocked()
@@ -79,7 +154,7 @@ func (r *pluginRuntime) applyConfig(cfg pluginConfig) {
 		})
 		return
 	}
-	if r.cache.empty() {
+	if r.cache.empty() || previous.CutoffPercentUsed != cfg.CutoffPercentUsed {
 		r.queueAllRefreshLocked()
 	}
 	r.log("info", "five-hour quota router configuration reloaded", map[string]any{

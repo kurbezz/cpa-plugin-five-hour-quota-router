@@ -143,6 +143,103 @@ func candidate(id string, priority int) pluginapi.SchedulerAuthCandidate {
 	return pluginapi.SchedulerAuthCandidate{ID: id, Provider: "claude", Priority: priority}
 }
 
+func beforeAuthRequest() pluginapi.RequestInterceptRequest {
+	return pluginapi.RequestInterceptRequest{Model: testModel, RequestedModel: testModel}
+}
+
+func TestInterceptBeforeAuthConfirmedExhaustionTerminates(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{
+		physicalEntry("auth-a", "index-a"), physicalEntry("auth-b", "index-b"),
+	}}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	resetA := now.Add(1500 * time.Millisecond)
+	runtime.cache.recordSuccess("auth-a", 96, resetA, now)
+	runtime.cache.recordSuccess("auth-b", 100, now.Add(time.Hour), now)
+
+	response := runtime.interceptBeforeAuth(beforeAuthRequest())
+	if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("response = %#v", response)
+	}
+	if got, want := response.ResponseHeaders.Get("Retry-After"), "2"; got != want {
+		t.Fatalf("Retry-After = %q, want %q", got, want)
+	}
+	if got, want := response.ResponseHeaders.Get("Content-Type"), "application/json; charset=utf-8"; got != want {
+		t.Fatalf("Content-Type = %q, want %q", got, want)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(response.ResponseBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 2 || body["code"] != exhaustedErrorCode || body["message"] != exhaustedErrorMessage(now, resetA, true) {
+		t.Fatalf("body = %#v", body)
+	}
+	if strings.Contains(string(response.ResponseBody), "auth-a") || strings.Contains(string(response.ResponseBody), "index-a") {
+		t.Fatalf("identity leaked in body: %s", response.ResponseBody)
+	}
+	_, getCalls := host.counts()
+	if getCalls != 0 {
+		t.Fatalf("interceptor called host.auth.get %d times", getCalls)
+	}
+}
+
+func TestInterceptBeforeAuthPassesThroughWhenNotSafelyExhausted(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name            string
+		fallbackEnabled bool
+		available       bool
+		unknown         bool
+	}{
+		{name: "available sibling", available: true},
+		{name: "unknown sibling", unknown: true},
+		{name: "overage fallback enabled", fallbackEnabled: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{
+				physicalEntry("auth-a", "index-a"), physicalEntry("auth-b", "index-b"),
+			}}
+			runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+			cfg := defaultPluginConfig()
+			cfg.OverageFallbackEnabled = test.fallbackEnabled
+			runtime.config.Store(&cfg)
+			runtime.cache.recordSuccess("auth-a", 96, now.Add(time.Hour), now)
+			if !test.unknown {
+				percent := 100.0
+				if test.available {
+					percent = 94.9
+				}
+				runtime.cache.recordSuccess("auth-b", percent, now.Add(time.Hour), now)
+			}
+			if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
+				t.Fatalf("response = %#v", response)
+			}
+		})
+	}
+}
+
+func TestInterceptBeforeAuthPassesThroughOnMembershipDiscoveryFailure(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	host := &fakeHost{listError: errors.New("host.auth.list unavailable")}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	runtime.cache.recordSuccess("stale-auth", 99, now.Add(time.Hour), now)
+
+	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
+		t.Fatalf("response = %#v", response)
+	}
+	_, getCalls := host.counts()
+	if getCalls != 0 {
+		t.Fatalf("interceptor called host.auth.get %d times", getCalls)
+	}
+}
+
 func weightedCandidate(id string, priority int, weight string) pluginapi.SchedulerAuthCandidate {
 	c := candidate(id, priority)
 	c.Attributes = map[string]string{"weight": weight}
@@ -1642,7 +1739,7 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 		registration.Metadata.Version != pluginVersion ||
 		registration.Metadata.Author != "kurbezz (fork of Smarty Pants Inc cpa-plugin-quota-router v0.5.0)" ||
 		registration.Metadata.GitHubRepository != "https://github.com/kurbezz/five-hour-quota-router" ||
-		!registration.Capabilities.Scheduler || !registration.Capabilities.ManagementAPI {
+		!registration.Capabilities.Scheduler || !registration.Capabilities.RequestInterceptor || !registration.Capabilities.ManagementAPI {
 		t.Fatalf("registration = %#v", registration)
 	}
 	fields := map[string]pluginapi.ConfigFieldType{}

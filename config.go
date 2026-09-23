@@ -45,8 +45,9 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	Scheduler     bool `json:"scheduler"`
-	ManagementAPI bool `json:"management_api"`
+	Scheduler          bool `json:"scheduler"`
+	RequestInterceptor bool `json:"request_interceptor"`
+	ManagementAPI      bool `json:"management_api"`
 }
 
 type managementRegistrationResponse struct {
@@ -199,6 +200,6 @@ func pluginRegistration() registration {
 				},
 			},
 		},
-		Capabilities: registrationCapabilities{Scheduler: true, ManagementAPI: true},
+		Capabilities: registrationCapabilities{Scheduler: true, RequestInterceptor: true, ManagementAPI: true},
 	}
 }

@@ -1,12 +1,53 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+func TestRequestInterceptBeforeABIDispatch(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{physicalEntry("auth-a", "index-a")}}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	runtime.cache.recordSuccess("auth-a", 99, now.Add(1500*time.Millisecond), now)
+	previous := activeRuntime
+	activeRuntime = runtime
+	defer func() { activeRuntime = previous }()
+
+	request, err := json.Marshal(beforeAuthRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleMethod(pluginabi.MethodRequestInterceptBefore, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		OK     bool                               `json:"ok"`
+		Result pluginapi.RequestInterceptResponse `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || !result.Result.Terminate || result.Result.StatusCode != http.StatusTooManyRequests || result.Result.ResponseHeaders.Get("Retry-After") != "2" {
+		t.Fatalf("result = %#v", result)
+	}
+	if _, err := handleMethod(pluginabi.MethodRequestInterceptBefore, []byte("{")); err == nil {
+		t.Fatal("malformed request JSON error = nil")
+	}
+}
 
 const abiBoundarySource = `
 #define _POSIX_C_SOURCE 200809L

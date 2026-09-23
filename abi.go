@@ -132,6 +132,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return errorEnvelope(decisionError.Code, decisionError.Message), nil
 		}
 		return okEnvelope(response)
+	case pluginabi.MethodRequestInterceptBefore:
+		var req pluginapi.RequestInterceptRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, fmt.Errorf("decode request interception request: %w", err)
+		}
+		return okEnvelope(activeRuntime.interceptBeforeAuth(req))
+	case pluginabi.MethodRequestInterceptAfter:
+		// RequestInterceptor advertises both lifecycle callbacks. This plugin's
+		// admission decision is deliberately before auth selection only.
+		var req pluginapi.RequestInterceptRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, fmt.Errorf("decode request interception request: %w", err)
+		}
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
