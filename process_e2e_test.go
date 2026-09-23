@@ -234,7 +234,9 @@ drainProxyHits:
 	if err != nil {
 		t.Fatal(err)
 	}
+	requestStarted := time.Now()
 	blockedStatus, blockedHeaders, blockedResponse := postClaudeMessageObserved(t, client, baseURL, e2eProtectedModel)
+	requestFinished := time.Now()
 	t.Logf("TASK4_OBSERVED protected_status=%d content_type=%q retry_after=%q body=%s", blockedStatus, blockedHeaders.Get("Content-Type"), blockedHeaders.Get("Retry-After"), blockedResponse)
 	if blockedStatus != http.StatusTooManyRequests {
 		t.Fatalf("protected request status=%d, want 429; body=%s\nserver log:\n%s", blockedStatus, blockedResponse, readLog(logPath))
@@ -248,9 +250,12 @@ drainProxyHits:
 	if err != nil || retryAfter < 1 {
 		t.Fatalf("protected Retry-After=%q parsed=%d err=%v, want positive seconds", blockedHeaders.Get("Retry-After"), retryAfter, err)
 	}
-	remaining := int64(math.Ceil(time.Until(fixtureReset).Seconds()))
-	if retryAfter > remaining || remaining-retryAfter > 3 {
-		t.Fatalf("protected Retry-After=%d, remaining fixture deadline=%d, want within 3 seconds", retryAfter, remaining)
+	// The server rounds up using its request-time clock. Bound the header by
+	// both sides of this request rather than comparing it to a later test clock.
+	maxRemaining := int64(math.Ceil(fixtureReset.Sub(requestStarted).Seconds()))
+	minRemaining := int64(math.Ceil(fixtureReset.Sub(requestFinished).Seconds()))
+	if retryAfter < minRemaining || retryAfter > maxRemaining+1 {
+		t.Fatalf("protected Retry-After=%d, reset bounds=[%d,%d]", retryAfter, minRemaining, maxRemaining+1)
 	}
 	var blockedBody struct {
 		Code string `json:"code"`
