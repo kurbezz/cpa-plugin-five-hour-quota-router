@@ -50,18 +50,23 @@ type quotaSample struct {
 	LastErrorCategory   string
 }
 
-// confirmedExhaustedReset atomically verifies the complete candidate set and
-// returns its earliest reset from that same cache snapshot.
-func (c *quotaCache) confirmedExhaustedReset(authIDs []string, now time.Time, cutoff float64) (time.Time, bool) {
-	if len(authIDs) == 0 {
-		return time.Time{}, false
-	}
+// confirmedFleetExhaustedReset atomically verifies exhaustion for and returns
+// the earliest reset from every credential CURRENTLY in the cache -- never a
+// caller-captured discovery snapshot -- under a single lock. Admission must
+// never miss a credential that a concurrent, newer discovery reconciled into
+// the cache after the caller's own membership list was captured: checking a
+// stale, caller-supplied ID list here could confirm "exhaustion" against a
+// membership that a newer reconciliation has already invalidated by adding an
+// available or unknown alternative.
+func (c *quotaCache) confirmedFleetExhaustedReset(now time.Time, cutoff float64) (time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.samples) == 0 {
+		return time.Time{}, false
+	}
 	var earliest time.Time
-	for _, authID := range authIDs {
-		sample, ok := c.samples[authID]
-		if !ok || !sample.HasSample || sample.ResetAt.IsZero() || !now.Before(sample.ResetAt) || sample.FiveHourPercentUsed < cutoff {
+	for _, sample := range c.samples {
+		if !sample.HasSample || sample.ResetAt.IsZero() || !now.Before(sample.ResetAt) || sample.FiveHourPercentUsed < cutoff {
 			return time.Time{}, false
 		}
 		if earliest.IsZero() || sample.ResetAt.Before(earliest) {
@@ -156,19 +161,6 @@ func (c *quotaCache) empty() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.samples) == 0
-}
-
-// memberIDs returns the membership from the same reconciled cache state used
-// for quota admission. It is used when a discovery response is superseded
-// before it can safely update that state.
-func (c *quotaCache) memberIDs() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ids := make([]string, 0, len(c.samples))
-	for authID := range c.samples {
-		ids = append(ids, authID)
-	}
-	return ids
 }
 
 // reconcile updates membership and returns IDs invalidated by a physical

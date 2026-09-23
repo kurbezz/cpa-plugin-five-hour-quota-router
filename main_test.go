@@ -71,6 +71,32 @@ func (h *pausedDiscoveryHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) 
 	return h.fakeHost.listAuth()
 }
 
+// pausedFirstCallHost pauses only its first listAuth call, then returns
+// normally for every later call. Unlike pausedDiscoveryHost (which serializes
+// every call behind a single sync.Once, deadlocking a genuinely concurrent
+// second call), this lets a second, independent discovery complete fully
+// while the first call is still blocked -- modeling a faster-completing,
+// newer discovery racing an older in-flight one.
+type pausedFirstCallHost struct {
+	*fakeHost
+	started chan struct{}
+	release <-chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (h *pausedFirstCallHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
+	h.mu.Lock()
+	h.calls++
+	call := h.calls
+	h.mu.Unlock()
+	if call == 1 {
+		close(h.started)
+		<-h.release
+	}
+	return h.fakeHost.listAuth()
+}
+
 func (h *fakeHost) listAuth() ([]pluginapi.HostAuthFileEntry, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1906,6 +1932,110 @@ func TestBlockedSamePathReplacementMetadataChangeQueuesRevisionCheck(t *testing.
 	})
 	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
 		t.Fatalf("replacement recovery remained gated: %#v", response)
+	}
+}
+
+// TestSupersededWorkerDiscoveryRetainsRevisionIntent covers the case where a
+// worker pass's own listAuth call is superseded by a newer, faster-completing
+// discovery (here, the before-auth interceptor's) before it can reconcile.
+// The revision intent that takePendingRefresh already dequeued for that pass
+// must not be silently dropped: requeueStaleDiscovery must put it back so the
+// worker retries it against a subsequent, necessarily-current discovery.
+func TestSupersededWorkerDiscoveryRetainsRevisionIntent(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	clock := &testClock{value: now}
+	entry := physicalEntry("auth-a", "index-a")
+	entry.Path, entry.Email = "/fixtures/superseded.json", ""
+	workerListStarted := make(chan struct{})
+	releaseWorkerList := make(chan struct{})
+	aCommitted := make(chan struct{})
+	var aCommitOnce sync.Once
+	host := &pausedFirstCallHost{
+		fakeHost: &fakeHost{
+			entries:  []pluginapi.HostAuthFileEntry{entry},
+			authJSON: map[string]json.RawMessage{"index-a": credentialJSON("new-token")},
+			logHook: func(_ string, message string, fields map[string]any) {
+				if message != "five-hour quota router quota refreshed" {
+					return
+				}
+				if fields["auth_id"] == "auth-a" {
+					aCommitOnce.Do(func() { close(aCommitted) })
+				}
+			},
+		},
+		started: workerListStarted,
+		release: releaseWorkerList,
+	}
+	runtime := newPluginRuntime(host, func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
+		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
+	}, clock.now)
+	cfg := defaultPluginConfig()
+	cfg.PollInterval = time.Hour
+	// Strict mode so the interceptor actually performs its own discovery.
+	cfg.OverageFallbackEnabled = false
+	runtime.config.Store(&cfg)
+	// Seed A as already known so the worker's revision path (not the ordinary
+	// unknown-candidate path) is what's exercised, matching a same-path
+	// credential replacement scenario.
+	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
+	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	// Bind the OLD credential's revision exactly as a real prior poll would, so
+	// the host's new-token credential is a genuine revision change.
+	generation, ok := runtime.cache.observedGeneration(auth)
+	if !ok {
+		t.Fatal("seed generation")
+	}
+	oldRevision := claudeCredentialRevision(claudeCredential{Type: "claude", AccessToken: "old-token"})
+	if _, bound := runtime.cache.bindRevision(auth, oldRevision, generation); !bound {
+		t.Fatal("seed old revision")
+	}
+	runtime.cache.recordSuccess("auth-a", 99, now.Add(time.Hour), now)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	runtime.wake, runtime.cancel, runtime.done = make(chan struct{}, 1), cancel, done
+	go runtime.refreshLoop(ctx, runtime.wake, done)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Queue A's revision intent and let the worker begin its own listAuth,
+	// which pausedFirstCallHost blocks on the first call only.
+	runtime.queueRevisionCheck("auth-a")
+	select {
+	case <-workerListStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not begin its own discovery for A's revision check")
+	}
+
+	// While the worker's listAuth is still blocked, run a second, independent
+	// discovery (the before-auth interceptor's) that completes fully and
+	// reconciles first - this is what makes the worker's own pending pass
+	// stale (!current) once it unblocks.
+	// A is still confirmed exhausted with the old sample, so a 429 here is the
+	// correct response; this call exists to complete a newer discovery.
+	_ = runtime.interceptBeforeAuth(beforeAuthRequest())
+	runtime.discoveryMu.Lock()
+	reconciled, issued := runtime.discoveryReconciled, runtime.discoveryIssued
+	runtime.discoveryMu.Unlock()
+	if reconciled != 2 || issued != 2 {
+		t.Fatalf("interceptor discovery did not supersede worker pass: reconciled=%d issued=%d", reconciled, issued)
+	}
+
+	// Release the worker's blocked listAuth call. Its pass is now superseded;
+	// requeueStaleDiscovery must restore A's revision intent rather than
+	// dropping it, and the worker's own inner retry loop must pick it back up
+	// against a fresh (current) discovery on this same wake, without any
+	// further external trigger.
+	close(releaseWorkerList)
+	select {
+	case <-aCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("A's revision intent was lost when its worker discovery was superseded")
+	}
+	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.FiveHourPercentUsed != 10 {
+		t.Fatalf("A's revision check did not eventually commit after supersession: %#v", sample)
 	}
 }
 

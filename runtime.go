@@ -41,40 +41,36 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		return pluginapi.RequestInterceptResponse{}
 	}
 	// A list response that began before a newer completed response must not
-	// prune that newer membership. Use the reconciled membership for this
-	// admission decision and avoid scheduling work from the stale response.
-	if !current {
-		authIDs := r.cache.memberIDs()
-		now := r.now()
-		resetAt, hasReset := r.cache.confirmedExhaustedReset(authIDs, now, cfg.CutoffPercentUsed)
-		if !hasReset {
-			return pluginapi.RequestInterceptResponse{}
-		}
-		return r.exhaustedInterceptResponse(now, resetAt, hasReset)
-	}
-	authIDs := make([]string, 0, len(auths))
-	for _, auth := range auths {
-		authIDs = append(authIDs, auth.ID)
-		// Ordinary unknowns retain normal per-ID throttle behavior. A replaced
-		// identity needs a full pass that remains pending behind an old in-flight
-		// poll sharing the same ID.
-		if !r.cache.snapshot(auth.ID).HasSample {
-			if _, wasReplaced := replaced[auth.ID]; wasReplaced {
-				r.queueRevisionCheck(auth.ID)
-			} else {
-				r.queueCandidateRefresh(auth.ID, cfg, r.now())
+	// prune that newer membership, and must not schedule work from the stale
+	// response (the newer, current discovery already owns that signal).
+	if current {
+		for _, auth := range auths {
+			// Ordinary unknowns retain normal per-ID throttle behavior. A replaced
+			// identity needs a full pass that remains pending behind an old in-flight
+			// poll sharing the same ID.
+			if !r.cache.snapshot(auth.ID).HasSample {
+				if _, wasReplaced := replaced[auth.ID]; wasReplaced {
+					r.queueRevisionCheck(auth.ID)
+				} else {
+					r.queueCandidateRefresh(auth.ID, cfg, r.now())
+				}
 			}
-		}
-		if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged {
-			// List metadata is merely a hint. Check the credential revision off the
-			// request path, including while its old quota sample is blocked.
-			r.queueRevisionCheck(auth.ID)
+			if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged {
+				// List metadata is merely a hint. Check the credential revision off the
+				// request path, including while its old quota sample is blocked.
+				r.queueRevisionCheck(auth.ID)
+			}
 		}
 	}
 	now := r.now()
-	// One locked cache snapshot prevents membership/quota reconciliation from
-	// splitting exhaustion validation and retry metadata across two states.
-	resetAt, hasReset := r.cache.confirmedExhaustedReset(authIDs, now, cfg.CutoffPercentUsed)
+	// Exhaustion is always validated against every credential CURRENTLY in the
+	// cache under one lock, never against this call's own (possibly stale)
+	// discovered ID list. A newer, concurrently completed discovery may have
+	// already reconciled an available or unknown alternative into the cache
+	// after this call captured its own membership; checking that stale list
+	// here could confirm "exhaustion" against membership the cache no longer
+	// holds.
+	resetAt, hasReset := r.cache.confirmedFleetExhaustedReset(now, cfg.CutoffPercentUsed)
 	if !hasReset {
 		return pluginapi.RequestInterceptResponse{}
 	}
@@ -179,6 +175,47 @@ func (r *pluginRuntime) discoverAuths() ([]physicalClaudeAuth, map[string]struct
 	replaced, changed := r.cache.reconcile(auths)
 	r.discoveryReconciled = generation
 	return auths, replaced, changed, true, nil
+}
+
+// requeueStaleDiscovery restores refresh/revision intent that a worker pass
+// already dequeued from the pending queue before discovering that its own
+// listAuth call was superseded by a newer, faster-completing discovery. It
+// merges that intent back onto the same worker-owned pending queue used by
+// queueCandidateRefresh/queueRevisionCheck (union with anything queued in the
+// meantime) so refreshLoop's own inner retry loop picks it back up against a
+// subsequent, necessarily-current discovery -- never dropping it, and never
+// widening it into an unthrottled fleet poll or a detached goroutine.
+func (r *pluginRuntime) requeueStaleDiscovery(all bool, authIDs, revisionIDs map[string]struct{}) {
+	r.refreshMu.Lock()
+	if all {
+		r.pendingAll = true
+		clear(r.pendingIDs)
+	} else {
+		if len(authIDs) > 0 {
+			if r.pendingIDs == nil {
+				r.pendingIDs = make(map[string]struct{}, len(authIDs))
+			}
+			for authID := range authIDs {
+				r.pendingIDs[authID] = struct{}{}
+			}
+		}
+		if len(revisionIDs) > 0 {
+			if r.pendingRevisionIDs == nil {
+				r.pendingRevisionIDs = make(map[string]struct{}, len(revisionIDs))
+			}
+			for authID := range revisionIDs {
+				r.pendingRevisionIDs[authID] = struct{}{}
+			}
+		}
+	}
+	wake := r.wake
+	r.refreshMu.Unlock()
+	if wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time) *pluginRuntime {
@@ -501,6 +538,15 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 		return
 	}
 	if !current {
+		// This pass's own listAuth call was superseded by a newer, faster-
+		// completing discovery (interceptor or another worker pass) before it
+		// could reconcile. The refresh/revision intent already dequeued by
+		// takePendingRefresh for this pass must not be silently dropped: put
+		// it back on the worker-owned pending queue so the same refreshLoop
+		// iteration retries it against a fresh (necessarily current, since
+		// discoveryIssued only grows) discovery, without introducing a
+		// detached goroutine or a fleet-wide unthrottled poll.
+		r.requeueStaleDiscovery(all, authIDs, revisionIDs)
 		return
 	}
 	// A targeted worker pass still receives the complete auth listing. Preserve
