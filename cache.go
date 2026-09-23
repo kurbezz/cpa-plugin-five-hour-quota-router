@@ -185,6 +185,21 @@ func (c *quotaCache) recordAttempt(authID string, attemptedAt time.Time) {
 	c.mu.Unlock()
 }
 
+// recordAttemptForIdentity records work only when the physical credential is
+// still the one that started that work. A reused auth ID must not receive state
+// from the credential it replaced.
+func (c *quotaCache) recordAttemptForIdentity(auth physicalClaudeAuth, attemptedAt time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || sample.Identity != auth.Identity {
+		return false
+	}
+	sample.LastAttemptAt = attemptedAt
+	c.samples[auth.ID] = sample
+	return true
+}
+
 func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, sampledAt time.Time) {
 	if strings.TrimSpace(authID) == "" {
 		return
@@ -201,6 +216,23 @@ func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, 
 	c.mu.Unlock()
 }
 
+func (c *quotaCache) recordSuccessForIdentity(auth physicalClaudeAuth, percentUsed float64, resetAt, sampledAt time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || sample.Identity != auth.Identity {
+		return false
+	}
+	sample.HasSample = true
+	sample.FiveHourPercentUsed = percentUsed
+	sample.SampledAt = sampledAt
+	sample.LastAttemptAt = sampledAt
+	sample.ResetAt = resetAt
+	sample.LastErrorCategory = ""
+	c.samples[auth.ID] = sample
+	return true
+}
+
 func (c *quotaCache) recordFailure(authID, category string) {
 	if strings.TrimSpace(authID) == "" {
 		return
@@ -210,6 +242,18 @@ func (c *quotaCache) recordFailure(authID, category string) {
 	sample.LastErrorCategory = category
 	c.samples[authID] = sample
 	c.mu.Unlock()
+}
+
+func (c *quotaCache) recordFailureForIdentity(auth physicalClaudeAuth, category string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || sample.Identity != auth.Identity {
+		return false
+	}
+	sample.LastErrorCategory = category
+	c.samples[auth.ID] = sample
+	return true
 }
 
 func (c *quotaCache) isBlocked(authID string, now time.Time, cutoff float64) bool {

@@ -41,6 +41,7 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 	auths := physicalClaudeAuths(entries)
 	r.cache.reconcile(auths)
 	authIDs := make([]string, 0, len(auths))
+	needsRefresh := false
 	for _, auth := range auths {
 		authIDs = append(authIDs, auth.ID)
 		// Reconciliation can have just added a credential or invalidated a
@@ -48,8 +49,13 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		// refresh so that unknown state is temporary, while keeping this callback
 		// free of auth.get and usage HTTP work.
 		if !r.cache.snapshot(auth.ID).HasSample {
-			r.queueCandidateRefresh(auth.ID, cfg, r.now())
+			needsRefresh = true
 		}
+	}
+	if needsRefresh {
+		// A full queued pass remains pending even if a prior pass is currently
+		// in flight, guaranteeing a replacement identity gets a follow-up poll.
+		r.queueAllRefresh()
 	}
 	now := r.now()
 	if !r.cache.allConfirmedExhausted(authIDs, now, cfg.CutoffPercentUsed) {
@@ -221,6 +227,15 @@ func (r *pluginRuntime) queueAllRefreshLocked() {
 	}
 }
 
+func (r *pluginRuntime) queueAllRefresh() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.wake == nil || r.cancel == nil || !r.loadedConfig().Enabled {
+		return
+	}
+	r.queueAllRefreshLocked()
+}
+
 func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, now time.Time) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
@@ -349,30 +364,34 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
-	r.cache.recordAttempt(auth.ID, r.now())
+	if !r.cache.recordAttemptForIdentity(auth, r.now()) {
+		return
+	}
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+		r.recordPollFailure(auth, pollErrorAuthGet)
 		return
 	}
 	var credential claudeCredential
 	if json.Unmarshal(rawAuth, &credential) != nil {
-		r.recordPollFailure(auth.ID, pollErrorAuthGet)
+		r.recordPollFailure(auth, pollErrorAuthGet)
 		return
 	}
 	token := strings.TrimSpace(credential.AccessToken)
 	if !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") || token == "" {
-		r.recordPollFailure(auth.ID, pollErrorMissingToken)
+		r.recordPollFailure(auth, pollErrorMissingToken)
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
 	if category != "" {
 		if category != pollErrorCancelled || ctx.Err() == nil {
-			r.recordPollFailure(auth.ID, category)
+			r.recordPollFailure(auth, category)
 		}
 		return
 	}
-	r.cache.recordSuccess(auth.ID, result.FiveHourPercentUsed, result.ResetAt, r.now())
+	if !r.cache.recordSuccessForIdentity(auth, result.FiveHourPercentUsed, result.ResetAt, r.now()) {
+		return
+	}
 	r.log("debug", "five-hour quota router quota refreshed", map[string]any{
 		"auth_id":                auth.ID,
 		"five_hour_percent_used": result.FiveHourPercentUsed,
@@ -380,10 +399,12 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	})
 }
 
-func (r *pluginRuntime) recordPollFailure(authID, category string) {
-	r.cache.recordFailure(authID, category)
+func (r *pluginRuntime) recordPollFailure(auth physicalClaudeAuth, category string) {
+	if !r.cache.recordFailureForIdentity(auth, category) {
+		return
+	}
 	r.log("warn", "five-hour quota router quota refresh failed", map[string]any{
-		"auth_id":  authID,
+		"auth_id":  auth.ID,
 		"category": category,
 	})
 }

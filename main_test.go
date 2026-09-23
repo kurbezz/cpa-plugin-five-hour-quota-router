@@ -295,6 +295,62 @@ func TestInterceptBeforeAuthQueuesRefreshForIdentityInvalidation(t *testing.T) {
 	}
 }
 
+func TestInterceptBeforeAuthReplacementIgnoresInFlightOldIdentity(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	oldEntry := physicalEntry("auth-a", "index-old")
+	host := &fakeHost{
+		entries: oldEntrySlice(oldEntry),
+		authJSON: map[string]json.RawMessage{
+			"index-old": credentialJSON("old-token"),
+			"index-new": credentialJSON("new-token"),
+		},
+	}
+	oldFetchStarted := make(chan struct{})
+	releaseOldFetch := make(chan struct{})
+	var fetchMu sync.Mutex
+	var fetches []string
+	fetch := func(_ context.Context, token string, _ time.Duration) (usageResult, string) {
+		fetchMu.Lock()
+		fetches = append(fetches, token)
+		fetchMu.Unlock()
+		if token == "old-token" {
+			close(oldFetchStarted)
+			<-releaseOldFetch
+			return usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}, ""
+		}
+		return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
+	}
+	runtime := newTestRuntime(host, fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	<-oldFetchStarted
+
+	newEntry := physicalEntry("auth-a", "index-new")
+	newEntry.Path = "/fixtures/replaced-auth-a.json"
+	host.mu.Lock()
+	host.entries = []pluginapi.HostAuthFileEntry{newEntry}
+	host.mu.Unlock()
+	if response := runtime.interceptBeforeAuth(beforeAuthRequest()); response.Terminate {
+		t.Fatalf("replacement was gated: %#v", response)
+	}
+	close(releaseOldFetch)
+
+	waitFor(t, func() bool {
+		fetchMu.Lock()
+		defer fetchMu.Unlock()
+		return len(fetches) == 2 && fetches[0] == "old-token" && fetches[1] == "new-token"
+	})
+	if sample := runtime.cache.snapshot("auth-a"); sample.Identity != physicalAuthIdentity(newEntry) || !sample.HasSample || sample.FiveHourPercentUsed != 10 {
+		t.Fatalf("replacement sample = %#v", sample)
+	}
+}
+
+func oldEntrySlice(entry pluginapi.HostAuthFileEntry) []pluginapi.HostAuthFileEntry {
+	return []pluginapi.HostAuthFileEntry{entry}
+}
+
 func weightedCandidate(id string, priority int, weight string) pluginapi.SchedulerAuthCandidate {
 	c := candidate(id, priority)
 	c.Attributes = map[string]string{"weight": weight}
