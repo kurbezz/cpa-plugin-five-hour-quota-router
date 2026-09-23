@@ -1584,6 +1584,41 @@ func TestRevisionOnlyCheckDoesNotConsumeUsageRefreshAttempt(t *testing.T) {
 	}
 }
 
+func TestCancelledRevisionRetryDoesNotEnqueueIntoRestartedLifecycle(t *testing.T) {
+	runtime := newTestRuntime(&fakeHost{}, nil, time.Now())
+	// Model a worker whose lifecycle has been cancelled before its delayed retry
+	// is due. The retry must return before touching the shared pending queue.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runtime.wake = make(chan struct{}, 1)
+	runtime.retryRevisionCheck(ctx, "auth-a")
+	runtime.refreshMu.Lock()
+	_, queued := runtime.pendingRevisionIDs["auth-a"]
+	runtime.refreshMu.Unlock()
+	if queued {
+		t.Fatal("cancelled lifecycle enqueued a revision retry")
+	}
+}
+
+func TestOverlapUsageAndRevisionGetFailureRetainsRevisionIntent(t *testing.T) {
+	now := time.Now()
+	entry := physicalEntry("auth-a", "index-a")
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entry}, authJSON: map[string]json.RawMessage{"index-a": credentialJSON("token-a")}, getErrors: map[string]error{"index-a": errors.New("transient")}}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	runtime.wake = make(chan struct{}, 1)
+	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
+	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	// selected usage plus independently queued revision must preserve the latter
+	// when the shared auth.get fails.
+	runtime.pollAuthWithRevisionIntent(context.Background(), auth, defaultPluginConfig(), false, true)
+	runtime.refreshMu.Lock()
+	_, queued := runtime.pendingRevisionIDs["auth-a"]
+	runtime.refreshMu.Unlock()
+	if !queued {
+		t.Fatal("overlapping usage/revision auth.get failure lost revision retry")
+	}
+}
+
 func TestSamePathCredentialReplacementInvalidatesAndRejectsOldInFlightResult(t *testing.T) {
 	now := time.Now().UTC()
 	entry := physicalEntry("auth-a", "index-a")

@@ -430,6 +430,12 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 				r.checkAuthRevision(ctx, auth, cfg)
 				continue
 			}
+			if selected && revisionCheck {
+				// The usage claim is already eligible, but preserve the independent
+				// revision signal if auth.get transiently fails.
+				r.pollAuthWithRevisionIntent(ctx, auth, cfg, false, true)
+				continue
+			}
 		}
 		r.pollAuth(ctx, auth, cfg, false)
 	}
@@ -439,17 +445,18 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 // discovery/read failure. It is per-ID, bounded and cancellation-aware; it
 // never turns metadata handling into a fleet poll.
 func (r *pluginRuntime) retryRevisionCheck(ctx context.Context, authID string) {
-	go func() {
-		const delay = 25 * time.Millisecond
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			r.queueRevisionCheckFromWorker(authID)
-		}
-	}()
+	// This runs on the sole refresh worker, rather than in a detached timer
+	// goroutine. Consequently shutdown cancellation interrupts the wait and an
+	// old lifecycle can never enqueue work into a later worker lifecycle.
+	const delay = 25 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		r.queueRevisionCheckFromWorker(authID)
+	}
 }
 
 func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
@@ -457,18 +464,30 @@ func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClau
 		// Preserve detection until the throttle window elapses without spinning
 		// the worker or widening this per-ID check into a fleet refresh.
 		delay := r.cache.revisionCheckDelay(auth.ID, r.now(), cfg.PollInterval)
-		go func() {
-			if delay > 0 {
-				time.Sleep(delay)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
 			}
-			r.queueRevisionCheck(auth.ID)
-		}()
+		}
+		r.queueRevisionCheckFromWorker(auth.ID)
 		return
 	}
 	r.pollAuth(ctx, auth, cfg, true)
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig, revisionCheck bool) {
+	r.pollAuthWithRevisionIntent(ctx, auth, cfg, revisionCheck, revisionCheck)
+}
+
+// pollAuthWithRevisionIntent separates revision-only usage eligibility from
+// retry ownership. A selected usage refresh may overlap a revision signal: it
+// should perform its eligible usage fetch, while retaining that signal if its
+// credential read is transiently unavailable.
+func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig, revisionCheck, revisionIntent bool) {
 	generation, current := r.cache.observedGeneration(auth)
 	if !current {
 		return
@@ -476,7 +495,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
-		if revisionCheck {
+		if revisionIntent {
 			r.retryRevisionCheck(ctx, auth.ID)
 		}
 		return
@@ -484,7 +503,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	var credential claudeCredential
 	if json.Unmarshal(rawAuth, &credential) != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
-		if revisionCheck {
+		if revisionIntent {
 			r.retryRevisionCheck(ctx, auth.ID)
 		}
 		return

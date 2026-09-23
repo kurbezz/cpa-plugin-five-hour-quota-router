@@ -27,3 +27,10 @@
 
 ## Commit
 ae8bffdd08b87b23f8dc9f1a0fe54d51a5e74a74 (followed by timing test commit)
+
+## Final review fixes
+- Delayed revision retries (including throttle waits) are now executed only by the refresh worker with a cancellation-aware timer; no detached retry goroutine can enqueue into a restarted runtime.
+- Polling now carries revision retry intent independently from revision-only eligibility, so a targeted usage/revision overlap retains the revision signal on transient `auth.get` failure.
+- Added deterministic cancellation/restart-queue and overlap failure regressions.
+
+Additional validation after final review: `go build ./...`, `go vet ./...`, `go test ./...` (130), `go test -race ./...` (129), and `git diff --check` passed.
