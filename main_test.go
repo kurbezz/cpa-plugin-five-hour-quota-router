@@ -240,6 +240,61 @@ func TestInterceptBeforeAuthPassesThroughOnMembershipDiscoveryFailure(t *testing
 	}
 }
 
+func TestInterceptBeforeAuthRejectsExplicitNonClaudeProtectedModel(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{physicalEntry("auth-a", "index-a")}}
+	runtime := newTestRuntime(host, (&fakeFetcher{}).fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	cfg.ProtectedModels = []string{"gpt-5"}
+	runtime.config.Store(&cfg)
+	runtime.cache.recordSuccess("auth-a", 100, now.Add(time.Hour), now)
+
+	response := runtime.interceptBeforeAuth(pluginapi.RequestInterceptRequest{Model: "gpt-5", RequestedModel: "gpt-5"})
+	if response.Terminate {
+		t.Fatalf("non-Claude request was gated: %#v", response)
+	}
+	listCalls, getCalls := host.counts()
+	if listCalls != 0 || getCalls != 0 {
+		t.Fatalf("non-Claude request performed callbacks: list=%d get=%d", listCalls, getCalls)
+	}
+}
+
+func TestInterceptBeforeAuthQueuesRefreshForIdentityInvalidation(t *testing.T) {
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	host := &fakeHost{
+		entries:  nil,
+		authJSON: map[string]json.RawMessage{"index-new": credentialJSON("new-token")},
+	}
+	fetcher := &fakeFetcher{replies: map[string][]fetchReply{
+		"new-token": {{result: usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}}},
+	}}
+	runtime := newTestRuntime(host, fetcher.fetch, now)
+	cfg := defaultPluginConfig()
+	cfg.OverageFallbackEnabled = false
+	runtime.applyConfig(cfg)
+	defer runtime.shutdown()
+	waitFor(t, func() bool { listCalls, _ := host.counts(); return listCalls > 0 })
+
+	old := physicalEntry("auth-a", "index-old")
+	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{old}))
+	runtime.cache.recordSuccess("auth-a", 99, now.Add(time.Hour), now)
+	newEntry := physicalEntry("auth-a", "index-new")
+	newEntry.Path = "/fixtures/replaced-auth-a.json"
+	host.mu.Lock()
+	host.entries = []pluginapi.HostAuthFileEntry{newEntry}
+	host.mu.Unlock()
+
+	response := runtime.interceptBeforeAuth(beforeAuthRequest())
+	if response.Terminate {
+		t.Fatalf("identity-invalidated sample was gated: %#v", response)
+	}
+	waitFor(t, func() bool { return fetcher.callCount() == 1 })
+	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.AuthIndex != "index-new" || sample.FiveHourPercentUsed != 10 {
+		t.Fatalf("refreshed sample = %#v", sample)
+	}
+}
+
 func weightedCandidate(id string, priority int, weight string) pluginapi.SchedulerAuthCandidate {
 	c := candidate(id, priority)
 	c.Attributes = map[string]string{"weight": weight}

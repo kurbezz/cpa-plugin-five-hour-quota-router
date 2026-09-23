@@ -23,8 +23,8 @@ type hostClient interface {
 // interceptBeforeAuth provides the narrow, fail-open HTTP admission gate used
 // before an upstream credential is selected. The request-interceptor SDK shape
 // intentionally has no Provider field at this lifecycle point, so Claude is
-// identified from the model name for the default all-Claude configuration; an
-// explicitly configured protected model remains an exact match.
+// identified from the model name. This gate must never apply to a non-Claude
+// request, even if an operator accidentally lists that model as protected.
 func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
 	cfg := r.loadedConfig()
 	if !cfg.Enabled || cfg.OverageFallbackEnabled || !isBeforeAuthProtectedClaudeRequest(req, cfg.ProtectedModels) || r.host == nil {
@@ -43,6 +43,13 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 	authIDs := make([]string, 0, len(auths))
 	for _, auth := range auths {
 		authIDs = append(authIDs, auth.ID)
+		// Reconciliation can have just added a credential or invalidated a
+		// reused ID after its physical identity changed. Request an asynchronous
+		// refresh so that unknown state is temporary, while keeping this callback
+		// free of auth.get and usage HTTP work.
+		if !r.cache.snapshot(auth.ID).HasSample {
+			r.queueCandidateRefresh(auth.ID, cfg, r.now())
+		}
 	}
 	now := r.now()
 	if !r.cache.allConfirmedExhausted(authIDs, now, cfg.CutoffPercentUsed) {
@@ -82,13 +89,10 @@ func isBeforeAuthProtectedClaudeRequest(req pluginapi.RequestInterceptRequest, p
 	if model == "" {
 		model = strings.TrimSpace(req.RequestedModel)
 	}
-	if !isProtectedModel(model, protectedModels) {
+	if !strings.HasPrefix(strings.ToLower(model), "claude") || !isProtectedModel(model, protectedModels) {
 		return false
 	}
-	if len(protectedModels) > 0 {
-		return true
-	}
-	return strings.HasPrefix(strings.ToLower(model), "claude")
+	return true
 }
 
 type claudeCredential struct {

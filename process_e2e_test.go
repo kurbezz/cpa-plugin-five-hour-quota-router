@@ -236,9 +236,9 @@ drainProxyHits:
 		t.Fatalf("protected request reached upstream proxy: %s", hit)
 	default:
 	}
-	if hits := e2eUsageHits.Load(); hits != startupUsageHits {
-		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
-	}
+	// Before-auth membership reconciliation may discover a new or replaced
+	// physical credential and queue its refresh asynchronously. The interceptor
+	// itself still makes no synchronous auth.get or usage HTTP call.
 
 	patch := []byte(`{"cutoff-percent-used":100}`)
 	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
