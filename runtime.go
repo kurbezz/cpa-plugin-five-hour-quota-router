@@ -110,10 +110,84 @@ func isBeforeAuthProtectedClaudeRequest(req pluginapi.RequestInterceptRequest, p
 	if model == "" {
 		model = strings.TrimSpace(req.RequestedModel)
 	}
-	if !strings.HasPrefix(strings.ToLower(model), "claude") || !isProtectedModel(model, protectedModels) {
+	if !isClaudeModelName(model) || !isProtectedModel(model, protectedModels) {
 		return false
 	}
 	return true
+}
+
+// isClaudeModelName identifies a Claude model from its name, the same
+// detection used for the before-auth admission gate. Header/stream
+// observation reuses it directly: quota sampling (like ordinary usage
+// polling) is not scoped to protected-models, only the admission gate is.
+func isClaudeModelName(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude")
+}
+
+// selectedAuthIDFromMetadata reads the host-published selected-credential ID.
+// It ignores anything that is not exactly a non-empty string: metadata is a
+// best-effort snapshot and must never be trusted beyond its documented shape.
+func selectedAuthIDFromMetadata(metadata map[string]any) (string, bool) {
+	if len(metadata) == 0 {
+		return "", false
+	}
+	raw, ok := metadata["selected_auth_id"]
+	if !ok {
+		return "", false
+	}
+	id, ok := raw.(string)
+	id = strings.TrimSpace(id)
+	if !ok || id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+// observeResponseHeaders is the shared, observe-only implementation behind
+// both the non-streaming response interceptor and the streaming header-init
+// interceptor call. It never performs host or network I/O, never blocks, and
+// silently ignores anything it cannot safely act on.
+func (r *pluginRuntime) observeResponseHeaders(model string, metadata map[string]any, headers http.Header, observedAt time.Time) {
+	if r == nil || !isClaudeModelName(model) {
+		return
+	}
+	authID, ok := selectedAuthIDFromMetadata(metadata)
+	if !ok {
+		return
+	}
+	observation := parseClaudeFiveHourHeaders(headers, observedAt)
+	if !observation.Valid {
+		return
+	}
+	if !r.cache.recordHeaderObservation(authID, observation) {
+		return
+	}
+	r.log("debug", "five-hour quota router quota observed from response headers", map[string]any{
+		"auth_id":                authID,
+		"five_hour_percent_used": observation.PercentUsed,
+	})
+}
+
+// interceptResponse observes real successful non-streaming upstream Claude
+// responses to keep the five-hour quota cache current for active accounts
+// without waiting for the next usage-API poll. It is strictly observe-only:
+// it always returns an empty response (no header/body rewriting) and never
+// performs host or network I/O.
+func (r *pluginRuntime) interceptResponse(req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
+	r.observeResponseHeaders(req.Model, req.Metadata, req.ResponseHeaders, r.now())
+	return pluginapi.ResponseInterceptResponse{}
+}
+
+// interceptStreamChunk observes the header-only stream initialization call
+// (ChunkIndex == StreamChunkHeaderInitIndex) the same way as a non-streaming
+// response. Every payload chunk (ChunkIndex >= 0) is an immediate no-op: the
+// rate-limit headers are only meaningful once, at stream start, and per-chunk
+// work here would scale with response size for no benefit.
+func (r *pluginRuntime) interceptStreamChunk(req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		r.observeResponseHeaders(req.Model, req.Metadata, req.ResponseHeaders, r.now())
+	}
+	return pluginapi.StreamChunkInterceptResponse{}
 }
 
 type claudeCredential struct {
@@ -634,6 +708,11 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 // should perform its eligible usage fetch, while retaining that signal if its
 // credential read is transiently unavailable.
 func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig, revisionCheck, revisionIntent bool) {
+	// Captured before any credential/usage work so a concurrent, faster header
+	// observation (from a real successful request) or a faster sibling poll
+	// that commits in the meantime is never overwritten by this call's later,
+	// now-stale usage result.
+	pollStartedAt := r.now()
 	generation, current := r.cache.observedGeneration(auth)
 	if !current {
 		return
@@ -680,7 +759,7 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 		}
 		return
 	}
-	if !r.cache.recordSuccessForGeneration(auth, generation, result.FiveHourPercentUsed, result.ResetAt, r.now()) {
+	if !r.cache.recordSuccessForGeneration(auth, generation, result.FiveHourPercentUsed, result.ResetAt, r.now(), pollStartedAt) {
 		return
 	}
 	r.log("debug", "five-hour quota router quota refreshed", map[string]any{

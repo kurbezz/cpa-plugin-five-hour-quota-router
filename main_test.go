@@ -2571,7 +2571,8 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 		registration.Metadata.Version != pluginVersion ||
 		registration.Metadata.Author != "kurbezz (fork of Smarty Pants Inc cpa-plugin-quota-router v0.5.0)" ||
 		registration.Metadata.GitHubRepository != "https://github.com/kurbezz/five-hour-quota-router" ||
-		!registration.Capabilities.Scheduler || !registration.Capabilities.RequestInterceptor || !registration.Capabilities.ManagementAPI {
+		!registration.Capabilities.Scheduler || !registration.Capabilities.RequestInterceptor || !registration.Capabilities.ManagementAPI ||
+		!registration.Capabilities.ResponseInterceptor || !registration.Capabilities.StreamChunkInterceptor {
 		t.Fatalf("registration = %#v", registration)
 	}
 	fields := map[string]pluginapi.ConfigFieldType{}

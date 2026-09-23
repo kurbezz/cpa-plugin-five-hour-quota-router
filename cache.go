@@ -379,16 +379,59 @@ func (c *quotaCache) recordSuccessForIdentity(auth physicalClaudeAuth, percentUs
 	return true
 }
 
-func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generation uint64, percentUsed float64, resetAt, sampledAt time.Time) bool {
+// recordSuccessForGeneration commits an /api/oauth/usage poll result.
+// pollStartedAt is the time this poll began its work (before its host.auth.get
+// and network round trip); if a sample already committed after that time --
+// whether from header observation of a concurrent real request, or from
+// another, faster usage poll -- this older poll must not overwrite it.
+func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generation uint64, percentUsed float64, resetAt, sampledAt, pollStartedAt time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
 	if !ok || !sampleMatchesAuth(sample, auth) || sample.ObservedGeneration != generation {
 		return false
 	}
+	if sample.HasSample && !sample.SampledAt.IsZero() && sample.SampledAt.After(pollStartedAt) {
+		return false
+	}
 	sample.HasSample, sample.FiveHourPercentUsed, sample.SampledAt = true, percentUsed, sampledAt
 	sample.LastAttemptAt, sample.ResetAt, sample.LastErrorCategory = sampledAt, resetAt, ""
 	c.samples[auth.ID] = sample
+	return true
+}
+
+// recordHeaderObservation commits a five-hour quota sample derived from a real
+// successful upstream response's rate-limit headers. It updates only an
+// existing cache member (never creates one) and never touches Revision,
+// ListRevision, or ObservedGeneration -- header observation is a pure quota
+// update, not a membership/identity signal. A poll started before this
+// observation's ObservedAt must not later overwrite it: callers use
+// recordSuccessForGeneration's minSampledAt comparison (via pollStartedAt) for
+// that; this method's own commit is unconditional on the current SampledAt
+// except that it never regresses an observation with a newer one already
+// recorded (compared by ObservedAt).
+func (c *quotaCache) recordHeaderObservation(authID string, observation headerObservation) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || !observation.Valid {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[authID]
+	if !ok {
+		return false
+	}
+	if sample.HasSample && !sample.SampledAt.IsZero() && observation.ObservedAt.Before(sample.SampledAt) {
+		// An older header observation must never overwrite a newer one already
+		// committed (from either a header observation or a usage poll).
+		return false
+	}
+	sample.HasSample = true
+	sample.FiveHourPercentUsed = observation.PercentUsed
+	sample.ResetAt = observation.ResetAt
+	sample.SampledAt = observation.ObservedAt
+	sample.LastErrorCategory = ""
+	c.samples[authID] = sample
 	return true
 }
 

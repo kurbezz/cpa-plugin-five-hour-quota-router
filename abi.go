@@ -146,6 +146,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, fmt.Errorf("decode request interception request: %w", err)
 		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	case pluginabi.MethodResponseInterceptAfter:
+		var req pluginapi.ResponseInterceptRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			// A malformed payload is a strict no-op, never an error that could
+			// affect response delivery.
+			return okEnvelope(pluginapi.ResponseInterceptResponse{})
+		}
+		return okEnvelope(activeRuntime.interceptResponse(req))
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		var req pluginapi.StreamChunkInterceptRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+		}
+		return okEnvelope(activeRuntime.interceptStreamChunk(req))
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
