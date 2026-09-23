@@ -40,6 +40,7 @@ type physicalClaudeAuth struct {
 	AuthIndex string
 	Name      string
 	Identity  string
+	Revision  string
 }
 
 func physicalClaudeAuths(entries []pluginapi.HostAuthFileEntry) []physicalClaudeAuth {

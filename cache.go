@@ -29,9 +29,12 @@ type cutoffAccountStatus struct {
 }
 
 type quotaSample struct {
-	AuthIndex           string
-	Name                string
-	Identity            string
+	AuthIndex string
+	Name      string
+	Identity  string
+	// Revision is a non-reversible digest derived asynchronously from the
+	// credential JSON. It is intentionally never included in status or logs.
+	Revision            string
 	HasSample           bool
 	FiveHourPercentUsed float64
 	SampledAt           time.Time
@@ -197,12 +200,42 @@ func (c *quotaCache) recordAttemptForIdentity(auth physicalClaudeAuth, attempted
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
-	if !ok || sample.Identity != auth.Identity {
+	if !ok || !sampleMatchesAuth(sample, auth) {
 		return false
 	}
 	sample.LastAttemptAt = attemptedAt
 	c.samples[auth.ID] = sample
 	return true
+}
+
+// bindRevision associates a credential-specific, non-secret revision with a
+// listed auth. A first observed revision preserves a valid sample because list
+// metadata cannot prove a replacement. A later different revision invalidates
+// that sample, making a same-path token replacement fail closed until polled.
+func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string) (physicalClaudeAuth, bool) {
+	if revision == "" {
+		return physicalClaudeAuth{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || sample.Identity != auth.Identity {
+		return physicalClaudeAuth{}, false
+	}
+	if sample.Revision != "" && sample.Revision != revision {
+		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity}
+	}
+	sample.Revision = revision
+	c.samples[auth.ID] = sample
+	auth.Revision = revision
+	return auth, true
+}
+
+func sampleMatchesAuth(sample quotaSample, auth physicalClaudeAuth) bool {
+	if sample.Identity != auth.Identity {
+		return false
+	}
+	return auth.Revision == "" || sample.Revision == auth.Revision
 }
 
 func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, sampledAt time.Time) {
@@ -225,7 +258,7 @@ func (c *quotaCache) recordSuccessForIdentity(auth physicalClaudeAuth, percentUs
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
-	if !ok || sample.Identity != auth.Identity {
+	if !ok || !sampleMatchesAuth(sample, auth) {
 		return false
 	}
 	sample.HasSample = true
@@ -253,7 +286,7 @@ func (c *quotaCache) recordFailureForIdentity(auth physicalClaudeAuth, category 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
-	if !ok || sample.Identity != auth.Identity {
+	if !ok || !sampleMatchesAuth(sample, auth) {
 		return false
 	}
 	sample.LastErrorCategory = category

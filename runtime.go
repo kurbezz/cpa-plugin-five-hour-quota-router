@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -105,8 +107,11 @@ func isBeforeAuthProtectedClaudeRequest(req pluginapi.RequestInterceptRequest, p
 }
 
 type claudeCredential struct {
-	Type        string `json:"type"`
-	AccessToken string `json:"access_token"`
+	Type             string `json:"type"`
+	AccessToken      string `json:"access_token"`
+	AccountUUID      string `json:"account_uuid"`
+	OrganizationID   string `json:"organization_id"`
+	OrganizationUUID string `json:"organization_uuid"`
 }
 
 type pluginRuntime struct {
@@ -367,9 +372,6 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
-	if !r.cache.recordAttemptForIdentity(auth, r.now()) {
-		return
-	}
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
@@ -383,6 +385,11 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 	token := strings.TrimSpace(credential.AccessToken)
 	if !strings.EqualFold(strings.TrimSpace(credential.Type), "claude") || token == "" {
 		r.recordPollFailure(auth, pollErrorMissingToken)
+		return
+	}
+	revision := claudeCredentialRevision(credential)
+	auth, ok := r.cache.bindRevision(auth, revision)
+	if !ok || !r.cache.recordAttemptForIdentity(auth, r.now()) {
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
@@ -400,6 +407,19 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		"five_hour_percent_used": result.FiveHourPercentUsed,
 		"blocked":                result.FiveHourPercentUsed >= cfg.CutoffPercentUsed,
 	})
+}
+
+// claudeCredentialRevision identifies a credential without retaining its raw
+// JSON or token. It is used only inside the refresh worker's cache path.
+func claudeCredentialRevision(credential claudeCredential) string {
+	input := strings.Join([]string{
+		strings.TrimSpace(credential.AccessToken),
+		strings.TrimSpace(credential.AccountUUID),
+		strings.TrimSpace(credential.OrganizationID),
+		strings.TrimSpace(credential.OrganizationUUID),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(input))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func (r *pluginRuntime) recordPollFailure(auth physicalClaudeAuth, category string) {

@@ -1475,6 +1475,88 @@ func TestCredentialReplacementClearsBeforeNetworkPolling(t *testing.T) {
 	}
 }
 
+func TestMetadataOnlyAuthUpdatePreservesCredentialRevisionAndSample(t *testing.T) {
+	now := time.Now().UTC()
+	entry := physicalEntry("auth-a", "index-a")
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
+	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	bound, ok := runtime.cache.bindRevision(auth, claudeCredentialRevision(claudeCredential{AccessToken: "token-a"}))
+	if !ok {
+		t.Fatal("bind initial revision")
+	}
+	runtime.cache.recordSuccessForIdentity(bound, 99, now.Add(time.Hour), now)
+
+	entry.Size = 12345
+	entry.ModTime = now.Add(time.Minute)
+	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry}))
+	sample := runtime.cache.snapshot("auth-a")
+	if !sample.HasSample || !sample.blocked(now, 95) {
+		t.Fatalf("metadata-only update cleared confirmed sample: %#v", sample)
+	}
+}
+
+func TestSamePathCredentialReplacementInvalidatesAndRejectsOldInFlightResult(t *testing.T) {
+	now := time.Now().UTC()
+	entry := physicalEntry("auth-a", "index-a")
+	entry.Path = "/fixtures/same-path.json"
+	entry.Email = ""
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entry}, authJSON: map[string]json.RawMessage{"index-a": credentialJSON("old-token")}}
+	oldFetchStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	newFetchStarted := make(chan struct{})
+	releaseNew := make(chan struct{})
+	fetch := func(ctx context.Context, token string, _ time.Duration) (usageResult, string) {
+		switch token {
+		case "old-token":
+			close(oldFetchStarted)
+			select {
+			case <-releaseOld:
+			case <-ctx.Done():
+				return usageResult{}, pollErrorCancelled
+			}
+			return usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}, ""
+		case "new-token":
+			close(newFetchStarted)
+			select {
+			case <-releaseNew:
+			case <-ctx.Done():
+				return usageResult{}, pollErrorCancelled
+			}
+			return usageResult{FiveHourPercentUsed: 10, ResetAt: now.Add(time.Hour)}, ""
+		default:
+			return usageResult{}, pollErrorNetwork
+		}
+	}
+	runtime := newTestRuntime(host, fetch, now)
+	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
+	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+
+	doneOld := make(chan struct{})
+	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig()); close(doneOld) }()
+	<-oldFetchStarted
+	host.mu.Lock()
+	host.authJSON["index-a"] = credentialJSON("new-token")
+	host.mu.Unlock()
+	doneNew := make(chan struct{})
+	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig()); close(doneNew) }()
+	<-newFetchStarted
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("same-path replacement retained old sample: %#v", sample)
+	}
+	close(releaseOld)
+	<-doneOld
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("old in-flight result committed to replacement: %#v", sample)
+	}
+	close(releaseNew)
+	<-doneNew
+	sample := runtime.cache.snapshot("auth-a")
+	if !sample.HasSample || sample.FiveHourPercentUsed != 10 {
+		t.Fatalf("replacement sample = %#v", sample)
+	}
+}
+
 func TestDisabledAuthIsNotPolled(t *testing.T) {
 	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{disabledEntry("auth-a", "index-a")}}
 	fetcher := &fakeFetcher{replies: map[string][]fetchReply{}}

@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -227,14 +230,39 @@ drainProxyHits:
 		return true
 	})
 
-	blockedResponse := postClaudeMessage(t, client, baseURL, e2eProtectedModel)
-	if !bytes.Contains(blockedResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("protected request did not return cutoff error: %s\nserver log:\n%s", blockedResponse, readLog(logPath))
+	fixtureReset, err := time.Parse(time.RFC3339, "2099-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedStatus, blockedHeaders, blockedResponse := postClaudeMessageObserved(t, client, baseURL, e2eProtectedModel)
+	t.Logf("TASK4_OBSERVED protected_status=%d content_type=%q retry_after=%q body=%s", blockedStatus, blockedHeaders.Get("Content-Type"), blockedHeaders.Get("Retry-After"), blockedResponse)
+	if blockedStatus != http.StatusTooManyRequests {
+		t.Fatalf("protected request status=%d, want 429; body=%s\nserver log:\n%s", blockedStatus, blockedResponse, readLog(logPath))
+	}
+	contentType := blockedHeaders.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "application/json" {
+		t.Fatalf("protected Content-Type=%q parsed=%q err=%v, want application/json", contentType, mediaType, err)
+	}
+	retryAfter, err := strconv.ParseInt(blockedHeaders.Get("Retry-After"), 10, 64)
+	if err != nil || retryAfter < 1 {
+		t.Fatalf("protected Retry-After=%q parsed=%d err=%v, want positive seconds", blockedHeaders.Get("Retry-After"), retryAfter, err)
+	}
+	remaining := int64(math.Ceil(time.Until(fixtureReset).Seconds()))
+	if retryAfter > remaining || remaining-retryAfter > 3 {
+		t.Fatalf("protected Retry-After=%d, remaining fixture deadline=%d, want within 3 seconds", retryAfter, remaining)
+	}
+	var blockedBody struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(blockedResponse, &blockedBody); err != nil || blockedBody.Code != exhaustedErrorCode {
+		t.Fatalf("protected JSON body=%s decoded=%#v err=%v", blockedResponse, blockedBody, err)
 	}
 	select {
 	case hit := <-proxyHits:
 		t.Fatalf("protected request reached upstream proxy: %s", hit)
 	default:
+		t.Log("TASK4_OBSERVED protected_upstream_fixture_hits=0")
 	}
 	// Before-auth membership reconciliation may discover a new or replaced
 	// physical credential and queue its refresh asynchronously. The interceptor
@@ -366,6 +394,23 @@ func postClaudeMessage(t *testing.T, client *http.Client, baseURL, model string)
 		t.Fatal(err)
 	}
 	return readResponseBody(t, response)
+}
+
+func postClaudeMessageObserved(t *testing.T, client *http.Client, baseURL, model string) (int, http.Header, []byte) {
+	t.Helper()
+	body := []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"ping"}]}`, model))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+e2eAPIKey)
+	request.Header.Set("Anthropic-Version", "2023-06-01")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode, response.Header.Clone(), readResponseBody(t, response)
 }
 
 func readResponseBody(t *testing.T, response *http.Response) []byte {
