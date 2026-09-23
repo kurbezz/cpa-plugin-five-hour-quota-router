@@ -145,6 +145,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, fmt.Errorf("decode request interception request: %w", err)
 		}
+		activeRuntime.recordSelectedAuth(req.RequestID, req.Metadata)
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	case pluginabi.MethodResponseInterceptAfter:
 		var req pluginapi.ResponseInterceptRequest

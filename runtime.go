@@ -147,11 +147,11 @@ func selectedAuthIDFromMetadata(metadata map[string]any) (string, bool) {
 // both the non-streaming response interceptor and the streaming header-init
 // interceptor call. It never performs host or network I/O, never blocks, and
 // silently ignores anything it cannot safely act on.
-func (r *pluginRuntime) observeResponseHeaders(model string, metadata map[string]any, headers http.Header, observedAt time.Time) {
+func (r *pluginRuntime) observeResponseHeaders(model, requestID string, headers http.Header, observedAt time.Time) {
 	if r == nil || !isClaudeModelName(model) {
 		return
 	}
-	authID, ok := selectedAuthIDFromMetadata(metadata)
+	correlation, ok := r.selectedAuthForRequest(requestID)
 	if !ok {
 		return
 	}
@@ -159,13 +159,10 @@ func (r *pluginRuntime) observeResponseHeaders(model string, metadata map[string
 	if !observation.Valid {
 		return
 	}
-	if !r.cache.recordHeaderObservation(authID, observation) {
+	if !r.cache.recordHeaderObservation(correlation.authID, correlation.generation, r.loadedConfig().CutoffPercentUsed, observation) {
 		return
 	}
-	r.log("debug", "five-hour quota router quota observed from response headers", map[string]any{
-		"auth_id":                authID,
-		"five_hour_percent_used": observation.PercentUsed,
-	})
+	r.consumeSelectedAuth(requestID, correlation)
 }
 
 // interceptResponse observes real successful non-streaming upstream Claude
@@ -174,7 +171,7 @@ func (r *pluginRuntime) observeResponseHeaders(model string, metadata map[string
 // it always returns an empty response (no header/body rewriting) and never
 // performs host or network I/O.
 func (r *pluginRuntime) interceptResponse(req pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse {
-	r.observeResponseHeaders(req.Model, req.Metadata, req.ResponseHeaders, r.now())
+	r.observeResponseHeaders(req.Model, req.RequestID, req.ResponseHeaders, r.now())
 	return pluginapi.ResponseInterceptResponse{}
 }
 
@@ -185,7 +182,7 @@ func (r *pluginRuntime) interceptResponse(req pluginapi.ResponseInterceptRequest
 // work here would scale with response size for no benefit.
 func (r *pluginRuntime) interceptStreamChunk(req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
 	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
-		r.observeResponseHeaders(req.Model, req.Metadata, req.ResponseHeaders, r.now())
+		r.observeResponseHeaders(req.Model, req.RequestID, req.ResponseHeaders, r.now())
 	}
 	return pluginapi.StreamChunkInterceptResponse{}
 }
@@ -224,6 +221,19 @@ type pluginRuntime struct {
 	deferredRevisionIDs map[string]time.Time
 	inFlightAll         bool
 	inFlightIDs         map[string]struct{}
+	selectedAuthMu      sync.Mutex
+	selectedAuths       map[string]selectedAuthCorrelation
+}
+
+const (
+	selectedAuthCorrelationTTL  = 10 * time.Minute
+	maxSelectedAuthCorrelations = 4096
+)
+
+type selectedAuthCorrelation struct {
+	authID     string
+	generation uint64
+	expiresAt  time.Time
 }
 
 // discoverAuths reconciles a host.auth.list snapshot unless a later-issued
@@ -249,6 +259,69 @@ func (r *pluginRuntime) discoverAuths() ([]physicalClaudeAuth, map[string]struct
 	replaced, changed := r.cache.reconcile(auths)
 	r.discoveryReconciled = generation
 	return auths, replaced, changed, true, nil
+}
+
+// recordSelectedAuth records only the non-secret selected auth ID correlated
+// with a request ID. CPA v7.3.8 copies execution metadata before auth choice,
+// so response hooks cannot rely on their Metadata carrying this value; the
+// after-auth request hook is the authoritative correlation point.
+func (r *pluginRuntime) recordSelectedAuth(requestID string, metadata map[string]any) {
+	if r == nil || strings.TrimSpace(requestID) == "" {
+		return
+	}
+	authID, ok := selectedAuthIDFromMetadata(metadata)
+	if !ok {
+		return
+	}
+	sample := r.cache.snapshot(authID)
+	if sample.Identity == "" {
+		return
+	}
+	now := r.now()
+	r.selectedAuthMu.Lock()
+	defer r.selectedAuthMu.Unlock()
+	if r.selectedAuths == nil {
+		r.selectedAuths = make(map[string]selectedAuthCorrelation)
+	}
+	for id, entry := range r.selectedAuths {
+		if !now.Before(entry.expiresAt) {
+			delete(r.selectedAuths, id)
+		}
+	}
+	if len(r.selectedAuths) >= maxSelectedAuthCorrelations {
+		var oldestID string
+		var oldest time.Time
+		for id, entry := range r.selectedAuths {
+			if oldestID == "" || entry.expiresAt.Before(oldest) || (entry.expiresAt.Equal(oldest) && id < oldestID) {
+				oldestID, oldest = id, entry.expiresAt
+			}
+		}
+		delete(r.selectedAuths, oldestID)
+	}
+	r.selectedAuths[requestID] = selectedAuthCorrelation{authID: authID, generation: sample.ObservedGeneration, expiresAt: now.Add(selectedAuthCorrelationTTL)}
+}
+
+func (r *pluginRuntime) selectedAuthForRequest(requestID string) (selectedAuthCorrelation, bool) {
+	if r == nil || strings.TrimSpace(requestID) == "" {
+		return selectedAuthCorrelation{}, false
+	}
+	now := r.now()
+	r.selectedAuthMu.Lock()
+	defer r.selectedAuthMu.Unlock()
+	entry, ok := r.selectedAuths[requestID]
+	if !ok || !now.Before(entry.expiresAt) {
+		delete(r.selectedAuths, requestID)
+		return selectedAuthCorrelation{}, false
+	}
+	return entry, true
+}
+
+func (r *pluginRuntime) consumeSelectedAuth(requestID string, expected selectedAuthCorrelation) {
+	r.selectedAuthMu.Lock()
+	defer r.selectedAuthMu.Unlock()
+	if current, ok := r.selectedAuths[requestID]; ok && current == expected {
+		delete(r.selectedAuths, requestID)
+	}
 }
 
 // requeueStaleDiscovery restores refresh/revision intent that a worker pass

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"testing"
@@ -121,11 +122,12 @@ func TestInterceptResponseUpdatesSelectedAuthSample(t *testing.T) {
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	auth := physicalClaudeAuth{ID: "auth-a", Identity: "same"}
 	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 
 	resetUnix := now.Add(3 * time.Hour).Unix()
 	response := runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
-		Model:    "claude-opus-4-1",
-		Metadata: map[string]any{"selected_auth_id": "auth-a"},
+		RequestID: "request-a",
+		Model:     "claude-opus-4-1",
 		ResponseHeaders: http.Header{
 			"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.42"},
 			"Anthropic-Ratelimit-Unified-5h-Reset":       []string{strconv.FormatInt(resetUnix, 10)},
@@ -145,36 +147,30 @@ func TestInterceptResponseIgnoresMissingOrUnknownSelectedAuthID(t *testing.T) {
 	now := time.Now().UTC()
 	headers := http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.42"}}
 
-	t.Run("missing metadata", func(t *testing.T) {
+	t.Run("missing correlation", func(t *testing.T) {
 		runtime := newTestRuntime(&fakeHost{}, nil, now)
 		runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
 		runtime.interceptResponse(pluginapi.ResponseInterceptRequest{Model: "claude-opus-4-1", ResponseHeaders: headers})
 		if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
-			t.Fatalf("sample updated without selected_auth_id: %#v", sample)
+			t.Fatalf("sample updated without correlation: %#v", sample)
 		}
 	})
 
-	t.Run("non-string metadata value", func(t *testing.T) {
+	t.Run("non-string after-auth metadata value", func(t *testing.T) {
 		runtime := newTestRuntime(&fakeHost{}, nil, now)
 		runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
-		runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
-			Model:           "claude-opus-4-1",
-			Metadata:        map[string]any{"selected_auth_id": 12345},
-			ResponseHeaders: headers,
-		})
+		runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": 12345})
+		runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: headers})
 		if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
 			t.Fatalf("sample updated from non-string selected_auth_id: %#v", sample)
 		}
 	})
 
-	t.Run("unknown auth ID", func(t *testing.T) {
+	t.Run("unknown after-auth auth ID", func(t *testing.T) {
 		runtime := newTestRuntime(&fakeHost{}, nil, now)
 		runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
-		runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
-			Model:           "claude-opus-4-1",
-			Metadata:        map[string]any{"selected_auth_id": "not-a-member"},
-			ResponseHeaders: headers,
-		})
+		runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "not-a-member"})
+		runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: headers})
 		if sample := runtime.cache.snapshot("not-a-member"); sample.HasSample {
 			t.Fatalf("sample created for unknown auth ID: %#v", sample)
 		}
@@ -185,9 +181,10 @@ func TestInterceptResponseIgnoresNonClaudeModel(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
+		RequestID:       "request-a",
 		Model:           "gpt-5",
-		Metadata:        map[string]any{"selected_auth_id": "auth-a"},
 		ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.9"}},
 	})
 	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
@@ -201,10 +198,11 @@ func TestInterceptStreamChunkHeaderInitUpdatesSample(t *testing.T) {
 	now := time.Now().UTC()
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 
 	response := runtime.interceptStreamChunk(pluginapi.StreamChunkInterceptRequest{
+		RequestID:       "request-a",
 		Model:           "claude-opus-4-1",
-		Metadata:        map[string]any{"selected_auth_id": "auth-a"},
 		ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.6"}},
 		ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
 	})
@@ -224,8 +222,8 @@ func TestInterceptStreamChunkPayloadIsNoOpAndDoesNotUpdate(t *testing.T) {
 
 	for _, index := range []int{0, 1, 42} {
 		response := runtime.interceptStreamChunk(pluginapi.StreamChunkInterceptRequest{
+			RequestID:       "request-a",
 			Model:           "claude-opus-4-1",
-			Metadata:        map[string]any{"selected_auth_id": "auth-a"},
 			ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.6"}},
 			ChunkIndex:      index,
 			Body:            []byte("data: {}\n\n"),
@@ -269,9 +267,10 @@ func TestStaleUsagePollDoesNotOverwriteNewerHeaderObservation(t *testing.T) {
 	// while the usage poll (started earlier, at the pre-advance clock value)
 	// is still in flight.
 	clock.set(now.Add(time.Second))
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
+		RequestID:       "request-a",
 		Model:           "claude-opus-4-1",
-		Metadata:        map[string]any{"selected_auth_id": "auth-a"},
 		ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.10"}},
 	})
 	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.FiveHourPercentUsed != 10 {
@@ -296,10 +295,10 @@ func TestOlderHeaderObservationDoesNotOverwriteNewerSample(t *testing.T) {
 
 	newer := headerObservation{PercentUsed: 80, ObservedAt: now.Add(time.Second), Valid: true}
 	older := headerObservation{PercentUsed: 5, ObservedAt: now, Valid: true}
-	if !runtime.cache.recordHeaderObservation("auth-a", newer) {
+	if !runtime.cache.recordHeaderObservation("auth-a", 0, 95, newer) {
 		t.Fatal("newer observation should commit")
 	}
-	if runtime.cache.recordHeaderObservation("auth-a", older) {
+	if runtime.cache.recordHeaderObservation("auth-a", 0, 95, older) {
 		t.Fatal("older observation should not commit")
 	}
 	if sample := runtime.cache.snapshot("auth-a"); sample.FiveHourPercentUsed != 80 {
@@ -330,9 +329,10 @@ func TestHeaderObservationAtCutoffTriggersBeforeAuth429(t *testing.T) {
 	}
 
 	resetUnix := now.Add(45 * time.Minute).Unix()
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{
-		Model:    "claude-opus-4-1",
-		Metadata: map[string]any{"selected_auth_id": "auth-a"},
+		RequestID: "request-a",
+		Model:     "claude-opus-4-1",
 		ResponseHeaders: http.Header{
 			"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"},
 			"Anthropic-Ratelimit-Unified-5h-Reset":  []string{strconv.FormatInt(resetUnix, 10)},
@@ -427,8 +427,8 @@ func TestResponseInterceptorABIDispatchHostShapedRPCEnvelope(t *testing.T) {
 	}
 	envelope := hostShapedResponseInterceptRequest{
 		ResponseInterceptRequest: pluginapi.ResponseInterceptRequest{
-			Model:    "claude-opus-4-1",
-			Metadata: map[string]any{"selected_auth_id": "auth-a", "selected_auth_index": "index-a"},
+			RequestID: "request-a",
+			Model:     "claude-opus-4-1",
 			ResponseHeaders: http.Header{
 				"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.71"},
 			},
@@ -436,6 +436,7 @@ func TestResponseInterceptorABIDispatchHostShapedRPCEnvelope(t *testing.T) {
 		},
 		HostCallbackID: "cb-123",
 	}
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 	request, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatal(err)
@@ -457,13 +458,14 @@ func TestResponseInterceptorABIDispatchUpdatesSample(t *testing.T) {
 	defer func() { activeRuntime = previous }()
 
 	req := pluginapi.ResponseInterceptRequest{
-		Model:    "claude-opus-4-1",
-		Metadata: map[string]any{"selected_auth_id": "auth-a"},
+		RequestID: "request-a",
+		Model:     "claude-opus-4-1",
 		ResponseHeaders: http.Header{
 			"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.33"},
 		},
 		StatusCode: http.StatusOK,
 	}
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
 	request, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -473,5 +475,78 @@ func TestResponseInterceptorABIDispatchUpdatesSample(t *testing.T) {
 	}
 	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.FiveHourPercentUsed != 33 {
 		t.Fatalf("sample = %#v", sample)
+	}
+}
+
+func TestAfterAuthABICorrelationDrivesMetadataFreeResponseObservation(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	previous := activeRuntime
+	activeRuntime = runtime
+	defer func() { activeRuntime = previous }()
+	after, _ := json.Marshal(pluginapi.RequestInterceptRequest{RequestID: "request-a", Metadata: map[string]any{"selected_auth_id": "auth-a"}})
+	if _, err := handleMethod(pluginabi.MethodRequestInterceptAfter, after); err != nil {
+		t.Fatal(err)
+	}
+	response, _ := json.Marshal(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.44"}}})
+	if _, err := handleMethod(pluginabi.MethodResponseInterceptAfter, response); err != nil {
+		t.Fatal(err)
+	}
+	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.FiveHourPercentUsed != 44 {
+		t.Fatalf("correlated response did not update cache: %#v", sample)
+	}
+}
+
+func TestSelectedAuthCorrelationTTLAndBoundedEviction(t *testing.T) {
+	now := time.Now().UTC()
+	clock := &testClock{value: now}
+	runtime := newPluginRuntime(&fakeHost{}, nil, clock.now)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	for i := 0; i < maxSelectedAuthCorrelations+1; i++ {
+		runtime.recordSelectedAuth(fmt.Sprintf("request-%04d", i), map[string]any{"selected_auth_id": "auth-a"})
+	}
+	runtime.selectedAuthMu.Lock()
+	count := len(runtime.selectedAuths)
+	_, oldestKept := runtime.selectedAuths["request-0000"]
+	_, newestKept := runtime.selectedAuths[fmt.Sprintf("request-%04d", maxSelectedAuthCorrelations)]
+	runtime.selectedAuthMu.Unlock()
+	if count != maxSelectedAuthCorrelations || oldestKept || !newestKept {
+		t.Fatalf("bounded correlation state count=%d oldest=%t newest=%t", count, oldestKept, newestKept)
+	}
+	clock.set(now.Add(selectedAuthCorrelationTTL))
+	if _, ok := runtime.selectedAuthForRequest("request-0001"); ok {
+		t.Fatal("expired correlation remained usable")
+	}
+}
+
+func TestStaleCorrelationGenerationCannotPopulateReplacement(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	old := physicalClaudeAuth{ID: "auth-a", Identity: "old"}
+	runtime.cache.reconcile([]physicalClaudeAuth{old})
+	runtime.recordSelectedAuth("request-a", map[string]any{"selected_auth_id": "auth-a"})
+	// A physical replacement advances ObservedGeneration between auth selection
+	// and the old response headers reaching the interceptor.
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "new"}})
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "request-a", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.9"}}})
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("stale response populated replacement: %#v", sample)
+	}
+}
+
+func TestHighHeaderWithoutResetIsIgnoredButLowHeaderIsHealthy(t *testing.T) {
+	now := time.Now().UTC()
+	runtime := newTestRuntime(&fakeHost{}, nil, now)
+	runtime.cache.reconcile([]physicalClaudeAuth{{ID: "auth-a", Identity: "same"}})
+	runtime.recordSelectedAuth("high", map[string]any{"selected_auth_id": "auth-a"})
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "high", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.99"}}})
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("high zero-reset header created indefinite blocked sample: %#v", sample)
+	}
+	runtime.recordSelectedAuth("low", map[string]any{"selected_auth_id": "auth-a"})
+	runtime.interceptResponse(pluginapi.ResponseInterceptRequest{RequestID: "low", Model: "claude-opus-4-1", ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.10"}}})
+	if sample := runtime.cache.snapshot("auth-a"); !sample.HasSample || sample.FiveHourPercentUsed != 10 || !sample.ResetAt.IsZero() {
+		t.Fatalf("low zero-reset healthy header was not accepted: %#v", sample)
 	}
 }

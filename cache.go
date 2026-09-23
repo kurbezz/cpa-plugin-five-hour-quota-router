@@ -391,7 +391,7 @@ func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generat
 	if !ok || !sampleMatchesAuth(sample, auth) || sample.ObservedGeneration != generation {
 		return false
 	}
-	if sample.HasSample && !sample.SampledAt.IsZero() && sample.SampledAt.After(pollStartedAt) {
+	if sample.HasSample && !sample.SampledAt.IsZero() && !sample.SampledAt.Before(pollStartedAt) {
 		return false
 	}
 	sample.HasSample, sample.FiveHourPercentUsed, sample.SampledAt = true, percentUsed, sampledAt
@@ -410,7 +410,7 @@ func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generat
 // that; this method's own commit is unconditional on the current SampledAt
 // except that it never regresses an observation with a newer one already
 // recorded (compared by ObservedAt).
-func (c *quotaCache) recordHeaderObservation(authID string, observation headerObservation) bool {
+func (c *quotaCache) recordHeaderObservation(authID string, generation uint64, cutoff float64, observation headerObservation) bool {
 	authID = strings.TrimSpace(authID)
 	if authID == "" || !observation.Valid {
 		return false
@@ -418,7 +418,10 @@ func (c *quotaCache) recordHeaderObservation(authID string, observation headerOb
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
-	if !ok {
+	if !ok || sample.ObservedGeneration != generation {
+		return false
+	}
+	if observation.ResetAt.IsZero() && observation.PercentUsed >= cutoff {
 		return false
 	}
 	if sample.HasSample && !sample.SampledAt.IsZero() && observation.ObservedAt.Before(sample.SampledAt) {
