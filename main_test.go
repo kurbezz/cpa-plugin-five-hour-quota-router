@@ -1499,7 +1499,7 @@ func TestMetadataOnlyAuthUpdatePreservesCredentialRevisionAndSample(t *testing.T
 	runtime := newTestRuntime(&fakeHost{}, nil, now)
 	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
 	_, _ = runtime.cache.reconcile([]physicalClaudeAuth{auth})
-	bound, ok := runtime.cache.bindRevision(auth, claudeCredentialRevision(claudeCredential{AccessToken: "token-a"}))
+	bound, ok := runtime.cache.bindRevision(auth, claudeCredentialRevision(claudeCredential{AccessToken: "token-a"}), 0)
 	if !ok {
 		t.Fatal("bind initial revision")
 	}
@@ -1511,6 +1511,76 @@ func TestMetadataOnlyAuthUpdatePreservesCredentialRevisionAndSample(t *testing.T
 	sample := runtime.cache.snapshot("auth-a")
 	if !sample.HasSample || !sample.blocked(now, 95) {
 		t.Fatalf("metadata-only update cleared confirmed sample: %#v", sample)
+	}
+}
+
+func TestMetadataObservationRejectsOlderInFlightSamePathResult(t *testing.T) {
+	now := time.Now().UTC()
+	entry := physicalEntry("auth-a", "index-a")
+	entry.Path, entry.Email = "/fixtures/same-path.json", ""
+	host := &fakeHost{entries: []pluginapi.HostAuthFileEntry{entry}, authJSON: map[string]json.RawMessage{"index-a": credentialJSON("old-token")}}
+	started, release := make(chan struct{}), make(chan struct{})
+	runtime := newTestRuntime(host, func(ctx context.Context, token string, _ time.Duration) (usageResult, string) {
+		close(started)
+		<-release
+		return usageResult{FiveHourPercentUsed: 99, ResetAt: now.Add(time.Hour)}, ""
+	}, now)
+	auth := physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry})[0]
+	runtime.cache.reconcile([]physicalClaudeAuth{auth})
+	done := make(chan struct{})
+	go func() { runtime.pollAuth(context.Background(), auth, defaultPluginConfig(), false); close(done) }()
+	<-started
+	// This is the list observation performed by the interceptor before its
+	// serial worker can execute the queued revision check.
+	entry.ModTime = entry.ModTime.Add(time.Second)
+	runtime.cache.reconcile(physicalClaudeAuths([]pluginapi.HostAuthFileEntry{entry}))
+	close(release)
+	<-done
+	if sample := runtime.cache.snapshot("auth-a"); sample.HasSample {
+		t.Fatalf("pre-observation usage work committed after metadata change: %#v", sample)
+	}
+}
+
+func TestBindRevisionPreservesLatestListBookkeepingOnReplacement(t *testing.T) {
+	now := time.Now().UTC()
+	cache := quotaCache{samples: make(map[string]quotaSample)}
+	auth := physicalClaudeAuth{ID: "a", Identity: "same", AuthIndex: "i", ListRevision: "B"}
+	cache.reconcile([]physicalClaudeAuth{auth})
+	bound, ok := cache.bindRevision(auth, "old", 0)
+	if !ok {
+		t.Fatal("bind old")
+	}
+	cache.recordSuccessForIdentity(bound, 99, now.Add(time.Hour), now)
+	cache.samples["a"] = func(s quotaSample) quotaSample { s.LastRevisionCheckAt = now.Add(-time.Minute); return s }(cache.samples["a"])
+	auth.ListRevision = "C"
+	cache.reconcile([]physicalClaudeAuth{auth})
+	cache.claimRevisionCheck("a", now, time.Hour)
+	bound, ok = cache.bindRevision(auth, "new", 1)
+	if !ok {
+		t.Fatal("bind new")
+	}
+	sample := cache.snapshot("a")
+	if sample.HasSample || sample.ListRevision != "C" || !sample.LastRevisionCheckAt.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("replacement bookkeeping/sample = %#v", sample)
+	}
+	_ = bound
+}
+
+func TestRevisionOnlyCheckDoesNotConsumeUsageRefreshAttempt(t *testing.T) {
+	now := time.Now().UTC()
+	cache := quotaCache{samples: map[string]quotaSample{"a": {Identity: "same", HasSample: true, FiveHourPercentUsed: 10, SampledAt: now.Add(-time.Hour), LastAttemptAt: now.Add(-time.Hour)}}}
+	auth := physicalClaudeAuth{ID: "a", Identity: "same"}
+	if !cache.claimRevisionCheck("a", now, time.Minute) {
+		t.Fatal("claim")
+	}
+	if !cache.completeRevisionCheck(auth, 0, now) {
+		t.Fatal("complete")
+	}
+	if !cache.shouldRefreshAfterRevisionCheck("a", now, 95, time.Minute) {
+		t.Fatal("overdue usage refresh was suppressed")
+	}
+	if got := cache.snapshot("a").LastAttemptAt; !got.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("revision check changed attempt time: %v", got)
 	}
 }
 

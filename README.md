@@ -68,7 +68,7 @@ overage-fallback-enabled: false
 
 ## Build and test
 
-Requires Go 1.26 and CLIProxyAPI v7.2.100 or newer.
+Requires Go 1.26 and CLIProxyAPI v7.3.8 or newer.
 
 ```bash
 make test

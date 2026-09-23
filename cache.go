@@ -34,15 +34,41 @@ type quotaSample struct {
 	Identity  string
 	// Revision is a non-reversible digest derived asynchronously from the
 	// credential JSON. It is intentionally never included in status or logs.
-	Revision            string
-	ListRevision        string
-	LastRevisionCheckAt time.Time
+	Revision               string
+	ListRevision           string
+	LastRevisionCheckAt    time.Time
+	RevisionCheckAttemptAt time.Time
+	// ObservedGeneration is bumped for every observed list-metadata change.
+	// It does not invalidate a committed sample, but makes older in-flight work
+	// ineligible to commit after a newer observation.
+	ObservedGeneration  uint64
 	HasSample           bool
 	FiveHourPercentUsed float64
 	SampledAt           time.Time
 	LastAttemptAt       time.Time
 	ResetAt             time.Time
 	LastErrorCategory   string
+}
+
+// confirmedExhaustedReset atomically verifies the complete candidate set and
+// returns its earliest reset from that same cache snapshot.
+func (c *quotaCache) confirmedExhaustedReset(authIDs []string, now time.Time, cutoff float64) (time.Time, bool) {
+	if len(authIDs) == 0 {
+		return time.Time{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var earliest time.Time
+	for _, authID := range authIDs {
+		sample, ok := c.samples[authID]
+		if !ok || !sample.HasSample || sample.ResetAt.IsZero() || !now.Before(sample.ResetAt) || sample.FiveHourPercentUsed < cutoff {
+			return time.Time{}, false
+		}
+		if earliest.IsZero() || sample.ResetAt.Before(earliest) {
+			earliest = sample.ResetAt
+		}
+	}
+	return earliest, !earliest.IsZero()
 }
 
 func (s quotaSample) known(now time.Time) bool {
@@ -146,11 +172,12 @@ func (c *quotaCache) reconcile(auths []physicalClaudeAuth) (map[string]struct{},
 		keep[auth.ID] = struct{}{}
 		sample := c.samples[auth.ID]
 		if sample.Identity != "" && auth.Identity != "" && sample.Identity != auth.Identity {
-			sample = quotaSample{}
+			sample = quotaSample{ObservedGeneration: sample.ObservedGeneration + 1}
 			replaced[auth.ID] = struct{}{}
 		}
 		if sample.ListRevision != "" && auth.ListRevision != "" && sample.ListRevision != auth.ListRevision {
 			changed[auth.ID] = struct{}{}
+			sample.ObservedGeneration++
 		}
 		sample.AuthIndex = auth.AuthIndex
 		sample.Name = strings.TrimSpace(auth.Name)
@@ -173,11 +200,25 @@ func (c *quotaCache) claimRevisionCheck(authID string, now time.Time, minimumAge
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
-	if !ok || (!sample.LastRevisionCheckAt.IsZero() && now.Before(sample.LastRevisionCheckAt.Add(minimumAge))) {
+	if !ok || (!sample.RevisionCheckAttemptAt.IsZero() && now.Before(sample.RevisionCheckAttemptAt.Add(minimumAge))) {
 		return false
 	}
-	sample.LastRevisionCheckAt = now
+	sample.RevisionCheckAttemptAt = now
 	c.samples[authID] = sample
+	return true
+}
+
+// completeRevisionCheck records only a successfully read and bound current
+// credential revision. Failed auth.list/auth.get work therefore remains due.
+func (c *quotaCache) completeRevisionCheck(auth physicalClaudeAuth, generation uint64, checkedAt time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || !sampleMatchesAuth(sample, auth) || sample.ObservedGeneration != generation {
+		return false
+	}
+	sample.LastRevisionCheckAt = checkedAt
+	c.samples[auth.ID] = sample
 	return true
 }
 
@@ -185,10 +226,10 @@ func (c *quotaCache) revisionCheckDelay(authID string, now time.Time, minimumAge
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
-	if !ok || sample.LastRevisionCheckAt.IsZero() {
+	if !ok || sample.RevisionCheckAttemptAt.IsZero() {
 		return 0
 	}
-	delay := sample.LastRevisionCheckAt.Add(minimumAge).Sub(now)
+	delay := sample.RevisionCheckAttemptAt.Add(minimumAge).Sub(now)
 	if delay < 0 {
 		return 0
 	}
@@ -267,23 +308,30 @@ func (c *quotaCache) recordAttemptForIdentity(auth physicalClaudeAuth, attempted
 // listed auth. A first observed revision preserves a valid sample because list
 // metadata cannot prove a replacement. A later different revision invalidates
 // that sample, making a same-path token replacement fail closed until polled.
-func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string) (physicalClaudeAuth, bool) {
+func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string, generation uint64) (physicalClaudeAuth, bool) {
 	if revision == "" {
 		return physicalClaudeAuth{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
-	if !ok || sample.Identity != auth.Identity {
+	if !ok || sample.Identity != auth.Identity || sample.ObservedGeneration != generation {
 		return physicalClaudeAuth{}, false
 	}
 	if sample.Revision != "" && sample.Revision != revision {
-		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity}
+		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration}
 	}
 	sample.Revision = revision
 	c.samples[auth.ID] = sample
 	auth.Revision = revision
 	return auth, true
+}
+
+func (c *quotaCache) observedGeneration(auth physicalClaudeAuth) (uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	return sample.ObservedGeneration, ok && sample.Identity == auth.Identity
 }
 
 func sampleMatchesAuth(sample quotaSample, auth physicalClaudeAuth) bool {
@@ -322,6 +370,19 @@ func (c *quotaCache) recordSuccessForIdentity(auth physicalClaudeAuth, percentUs
 	sample.LastAttemptAt = sampledAt
 	sample.ResetAt = resetAt
 	sample.LastErrorCategory = ""
+	c.samples[auth.ID] = sample
+	return true
+}
+
+func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generation uint64, percentUsed float64, resetAt, sampledAt time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || !sampleMatchesAuth(sample, auth) || sample.ObservedGeneration != generation {
+		return false
+	}
+	sample.HasSample, sample.FiveHourPercentUsed, sample.SampledAt = true, percentUsed, sampledAt
+	sample.LastAttemptAt, sample.ResetAt, sample.LastErrorCategory = sampledAt, resetAt, ""
 	c.samples[auth.ID] = sample
 	return true
 }

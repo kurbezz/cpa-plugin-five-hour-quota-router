@@ -62,11 +62,12 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		}
 	}
 	now := r.now()
-	if !r.cache.allConfirmedExhausted(authIDs, now, cfg.CutoffPercentUsed) {
+	// One locked cache snapshot prevents membership/quota reconciliation from
+	// splitting exhaustion validation and retry metadata across two states.
+	resetAt, hasReset := r.cache.confirmedExhaustedReset(authIDs, now, cfg.CutoffPercentUsed)
+	if !hasReset {
 		return pluginapi.RequestInterceptResponse{}
 	}
-
-	resetAt, hasReset := r.cache.earliestFutureReset(authIDs, now)
 	body, err := json.Marshal(struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
@@ -84,7 +85,7 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		},
 		ResponseBody: body,
 	}
-	if hasReset && now.Before(resetAt) {
+	if now.Before(resetAt) {
 		retryAfterSeconds := int64(math.Ceil(resetAt.Sub(now).Seconds()))
 		if retryAfterSeconds < 1 {
 			retryAfterSeconds = 1
@@ -401,6 +402,9 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	entries, err := r.host.listAuth()
 	if err != nil {
 		r.log("warn", "five-hour quota router auth discovery failed", map[string]any{"category": "auth_list"})
+		for authID := range revisionIDs {
+			r.retryRevisionCheck(ctx, authID)
+		}
 		return
 	}
 	auths := physicalClaudeAuths(entries)
@@ -431,6 +435,23 @@ func (r *pluginRuntime) refreshAuths(ctx context.Context, cfg pluginConfig, all 
 	}
 }
 
+// retryRevisionCheck keeps a detected replacement pending after a transient
+// discovery/read failure. It is per-ID, bounded and cancellation-aware; it
+// never turns metadata handling into a fleet poll.
+func (r *pluginRuntime) retryRevisionCheck(ctx context.Context, authID string) {
+	go func() {
+		const delay = 25 * time.Millisecond
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			r.queueRevisionCheckFromWorker(authID)
+		}
+	}()
+}
+
 func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig) {
 	if !r.cache.claimRevisionCheck(auth.ID, r.now(), cfg.PollInterval) {
 		// Preserve detection until the throttle window elapses without spinning
@@ -448,14 +469,24 @@ func (r *pluginRuntime) checkAuthRevision(ctx context.Context, auth physicalClau
 }
 
 func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, cfg pluginConfig, revisionCheck bool) {
+	generation, current := r.cache.observedGeneration(auth)
+	if !current {
+		return
+	}
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
+		if revisionCheck {
+			r.retryRevisionCheck(ctx, auth.ID)
+		}
 		return
 	}
 	var credential claudeCredential
 	if json.Unmarshal(rawAuth, &credential) != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
+		if revisionCheck {
+			r.retryRevisionCheck(ctx, auth.ID)
+		}
 		return
 	}
 	token := strings.TrimSpace(credential.AccessToken)
@@ -464,11 +495,17 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		return
 	}
 	revision := claudeCredentialRevision(credential)
-	auth, ok := r.cache.bindRevision(auth, revision)
-	if !ok || !r.cache.recordAttemptForIdentity(auth, r.now()) {
+	auth, ok := r.cache.bindRevision(auth, revision, generation)
+	if !ok {
+		return
+	}
+	if revisionCheck && !r.cache.completeRevisionCheck(auth, generation, r.now()) {
 		return
 	}
 	if revisionCheck && !r.cache.shouldRefreshAfterRevisionCheck(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.PollInterval) {
+		return
+	}
+	if !r.cache.recordAttemptForIdentity(auth, r.now()) {
 		return
 	}
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
@@ -478,7 +515,7 @@ func (r *pluginRuntime) pollAuth(ctx context.Context, auth physicalClaudeAuth, c
 		}
 		return
 	}
-	if !r.cache.recordSuccessForIdentity(auth, result.FiveHourPercentUsed, result.ResetAt, r.now()) {
+	if !r.cache.recordSuccessForGeneration(auth, generation, result.FiveHourPercentUsed, result.ResetAt, r.now()) {
 		return
 	}
 	r.log("debug", "five-hour quota router quota refreshed", map[string]any{
