@@ -55,6 +55,9 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 					r.queueCandidateRefresh(auth.ID, cfg, r.now())
 				}
 			}
+			if r.cache.usageRefreshDue(auth.ID, cfg, r.now()) {
+				r.queueCandidateRefresh(auth.ID, cfg, r.now())
+			}
 			if _, listMetadataChanged := changed[auth.ID]; listMetadataChanged {
 				// List metadata is merely a hint. Check the credential revision off the
 				// request path, including while its old quota sample is blocked.
@@ -75,6 +78,17 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 		return pluginapi.RequestInterceptResponse{}
 	}
 	return r.exhaustedInterceptResponse(now, resetAt, hasReset)
+}
+
+func (c *quotaCache) usageRefreshDue(authID string, cfg pluginConfig, now time.Time) bool {
+	s := c.snapshot(authID)
+	if s.Incarnation == 0 {
+		return false
+	}
+	if refreshSuppressed(s, now, cfg.CutoffPercentUsed) {
+		return false
+	}
+	return usageRefreshDueSample(s, now, cfg.CutoffPercentUsed, cfg.PollInterval)
 }
 
 func (r *pluginRuntime) exhaustedInterceptResponse(now time.Time, resetAt time.Time, hasReset bool) pluginapi.RequestInterceptResponse {
@@ -155,11 +169,13 @@ func (r *pluginRuntime) observeResponseHeaders(model, requestID string, headers 
 	if !ok {
 		return
 	}
-	observation := parseClaudeFiveHourHeaders(headers, observedAt)
-	if !observation.Valid {
+	batch := parseClaudeQuotaHeaders(headers, model, observedAt, r.loadedConfig().CutoffPercentUsed)
+	if !batch.FiveHour.Valid && !batch.Weekly.Valid && !batch.FableWeekly.Valid && !batch.OpusWeekly.Valid && !batch.SonnetWeekly.Valid {
+		r.consumeSelectedAuth(requestID, correlation)
 		return
 	}
-	if !r.cache.recordHeaderObservation(correlation.authID, correlation.generation, correlation.incarnation, r.loadedConfig().CutoffPercentUsed, observation) {
+	auth := physicalClaudeAuth{ID: correlation.authID}
+	if !r.cache.commitWindowBatch(auth, correlation.generation, correlation.incarnation, batch, observedAt, time.Time{}, false) {
 		return
 	}
 	r.consumeSelectedAuth(requestID, correlation)
@@ -511,7 +527,7 @@ func (r *pluginRuntime) queueCandidateRefresh(authID string, cfg pluginConfig, n
 		r.refreshMu.Unlock()
 		return
 	}
-	if !r.cache.claimRefresh(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
+	if !r.cache.claimPoll(authID, now, cfg.CutoffPercentUsed, cfg.PollInterval) {
 		r.refreshMu.Unlock()
 		return
 	}
@@ -794,7 +810,7 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 	// that commits in the meantime is never overwritten by this call's later,
 	// now-stale usage result.
 	pollStartedAt := r.now()
-	generation, current := r.cache.observedGeneration(auth)
+	generation, incarnation, current := r.cache.bindingSnapshot(auth)
 	if !current {
 		return
 	}
@@ -820,7 +836,8 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 		return
 	}
 	revision := claudeCredentialRevision(credential)
-	auth, ok := r.cache.bindRevision(auth, revision, generation)
+	var ok bool
+	auth, incarnation, ok = r.cache.bindRevisionForIncarnation(auth, revision, generation, incarnation)
 	if !ok {
 		return
 	}
@@ -828,6 +845,9 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 		return
 	}
 	if revisionCheck && !r.cache.shouldRefreshAfterRevisionCheck(auth.ID, r.now(), cfg.CutoffPercentUsed, cfg.PollInterval) {
+		return
+	}
+	if !r.cache.recordUsageAttempt(auth, generation, incarnation, r.now()) {
 		return
 	}
 	if !r.cache.recordAttemptForIdentity(auth, r.now()) {
@@ -840,7 +860,11 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 		}
 		return
 	}
-	if !r.cache.recordSuccessForGeneration(auth, generation, result.FiveHourPercentUsed, result.ResetAt, r.now(), pollStartedAt) {
+	batch := result.Windows
+	if !batch.FiveHour.Valid {
+		batch.FiveHour = quotaWindow{Percent: result.FiveHourPercentUsed, ResetAt: result.ResetAt, Source: quotaSourceUsage, Valid: true}
+	}
+	if !r.cache.commitWindowBatch(auth, generation, incarnation, batch, r.now(), pollStartedAt, true) {
 		return
 	}
 	r.log("debug", "five-hour quota router quota refreshed", map[string]any{

@@ -51,6 +51,9 @@ type quotaSample struct {
 	LastAttemptAt       time.Time
 	ResetAt             time.Time
 	LastErrorCategory   string
+	Windows             quotaWindowBatch
+	UsageAttemptAt      time.Time
+	UsageSuccessAt      time.Time
 }
 
 // confirmedFleetExhaustedReset atomically verifies exhaustion for and returns
@@ -80,10 +83,21 @@ func (c *quotaCache) confirmedFleetExhaustedReset(now time.Time, cutoff float64)
 }
 
 func (s quotaSample) known(now time.Time) bool {
+	if !s.Windows.FiveHour.Valid && s.HasSample {
+		return s.HasSample && (s.ResetAt.IsZero() || now.Before(s.ResetAt))
+	}
+	if s.Windows.FiveHour.Valid {
+		w := s.Windows.FiveHour
+		return w.ResetAt.IsZero() || now.Before(w.ResetAt)
+	}
 	return s.HasSample && (s.ResetAt.IsZero() || now.Before(s.ResetAt))
 }
 
 func (s quotaSample) blocked(now time.Time, cutoff float64) bool {
+	if s.Windows.FiveHour.Valid {
+		w := s.Windows.FiveHour
+		return (w.ResetAt.IsZero() || now.Before(w.ResetAt)) && w.Percent >= cutoff
+	}
 	return s.known(now) && s.FiveHourPercentUsed >= cutoff
 }
 
@@ -94,6 +108,10 @@ func (s quotaSample) blocked(now time.Time, cutoff float64) bool {
 // genuinely rolls over at resets_at — this is a deliberate, scoped fail-open specific to
 // confirmed window expiry, not a general unknown-quota fail-open.
 func (s quotaSample) excluded(now time.Time, cutoff float64) bool {
+	if s.Windows.FiveHour.Valid {
+		w := s.Windows.FiveHour
+		return (w.ResetAt.IsZero() || now.Before(w.ResetAt)) && w.Percent >= cutoff
+	}
 	if !s.HasSample {
 		return true
 	}
@@ -101,6 +119,78 @@ func (s quotaSample) excluded(now time.Time, cutoff float64) bool {
 		return false
 	}
 	return s.FiveHourPercentUsed >= cutoff
+}
+
+func syncFiveHourCompatibility(sample *quotaSample, w quotaWindow) {
+	if !w.Valid {
+		return
+	}
+	sample.Windows.FiveHour = w
+	sample.HasSample = true
+	sample.FiveHourPercentUsed = w.Percent
+	sample.ResetAt = w.ResetAt
+	sample.SampledAt = w.SampledAt
+}
+
+func (c *quotaCache) snapshotWindows(authID string) quotaWindowBatch {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.samples[authID].Windows
+}
+
+func (c *quotaCache) recordUsageAttempt(auth physicalClaudeAuth, generation, incarnation uint64, at time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.samples[auth.ID]
+	if !ok || !sampleMatchesAuth(s, auth) || s.ObservedGeneration != generation || s.Incarnation != incarnation {
+		return false
+	}
+	s.UsageAttemptAt = at
+	s.LastAttemptAt = at
+	c.samples[auth.ID] = s
+	return true
+}
+
+func (c *quotaCache) commitWindowBatch(auth physicalClaudeAuth, generation, incarnation uint64, batch quotaWindowBatch, sampledAt, pollStartedAt time.Time, isPoll bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || (auth.Identity != "" && !sampleMatchesAuth(sample, auth)) || sample.ObservedGeneration != generation || sample.Incarnation != incarnation {
+		return false
+	}
+	slots := []*quotaWindow{&sample.Windows.FiveHour, &sample.Windows.Weekly, &sample.Windows.FableWeekly, &sample.Windows.OpusWeekly, &sample.Windows.SonnetWeekly}
+	incoming := []quotaWindow{batch.FiveHour, batch.Weekly, batch.FableWeekly, batch.OpusWeekly, batch.SonnetWeekly}
+	changed := false
+	for i, next := range incoming {
+		if !next.Valid {
+			continue
+		}
+		if isPoll {
+			next.SampledAt = sampledAt
+		}
+		old := *slots[i]
+		if old.Valid && !old.SampledAt.IsZero() {
+			if isPoll && !old.SampledAt.Before(pollStartedAt) {
+				continue
+			}
+			if !isPoll && next.SampledAt.Before(old.SampledAt) {
+				continue
+			}
+		}
+		*slots[i] = next
+		if i == 0 {
+			syncFiveHourCompatibility(&sample, next)
+		}
+		changed = true
+	}
+	if changed {
+		sample.LastErrorCategory = ""
+	}
+	if isPoll && (sample.UsageSuccessAt.IsZero() || sampledAt.After(sample.UsageSuccessAt)) {
+		sample.UsageSuccessAt = sampledAt
+	}
+	c.samples[auth.ID] = sample
+	return changed
 }
 
 type quotaCache struct {
@@ -257,16 +347,30 @@ func (c *quotaCache) shouldRefreshAfterRevisionCheck(authID string, now time.Tim
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[authID]
-	if !ok || !sample.HasSample {
-		return true
+	return ok && usageRefreshDueSample(sample, now, cutoff, minimumAge)
+}
+
+func refreshSuppressed(sample quotaSample, now time.Time, cutoff float64) bool {
+	for _, w := range []quotaWindow{sample.Windows.FiveHour, sample.Windows.Weekly} {
+		if w.Valid && w.Percent >= cutoff && !w.ResetAt.IsZero() && now.Before(w.ResetAt) {
+			return true
+		}
 	}
-	if sample.blocked(now, cutoff) {
+	return false
+}
+
+func latestUsageTime(sample quotaSample) time.Time {
+	if sample.UsageSuccessAt.After(sample.UsageAttemptAt) {
+		return sample.UsageSuccessAt
+	}
+	return sample.UsageAttemptAt
+}
+
+func usageRefreshDueSample(sample quotaSample, now time.Time, cutoff float64, minimumAge time.Duration) bool {
+	if refreshSuppressed(sample, now, cutoff) {
 		return false
 	}
-	last := sample.SampledAt
-	if sample.LastAttemptAt.After(last) {
-		last = sample.LastAttemptAt
-	}
+	last := latestUsageTime(sample)
 	return last.IsZero() || !now.Before(last.Add(minimumAge))
 }
 
@@ -277,18 +381,31 @@ func (c *quotaCache) claimRefresh(authID string, now time.Time, cutoff float64, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample := c.samples[authID]
-	if sample.blocked(now, cutoff) {
+	if sample.Incarnation == 0 || refreshSuppressed(sample, now, cutoff) {
 		return false
 	}
-	lastCheck := sample.SampledAt
-	if sample.LastAttemptAt.After(lastCheck) {
-		lastCheck = sample.LastAttemptAt
-	}
-	if !lastCheck.IsZero() && now.Before(lastCheck.Add(minimumAge)) {
+	if !usageRefreshDueSample(sample, now, cutoff, minimumAge) {
 		return false
 	}
 	sample.LastAttemptAt = now
+	sample.UsageAttemptAt = now
 	c.samples[authID] = sample
+	return true
+}
+
+func (c *quotaCache) claimPoll(authID string, now time.Time, cutoff float64, minimumAge time.Duration) bool {
+	if strings.TrimSpace(authID) == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.samples[authID]
+	if !ok || s.Incarnation == 0 || !usageRefreshDueSample(s, now, cutoff, minimumAge) {
+		return false
+	}
+	s.UsageAttemptAt = now
+	s.LastAttemptAt = now
+	c.samples[authID] = s
 	return true
 }
 
@@ -323,14 +440,19 @@ func (c *quotaCache) recordAttemptForIdentity(auth physicalClaudeAuth, attempted
 // metadata cannot prove a replacement. A later different revision invalidates
 // that sample, making a same-path token replacement fail closed until polled.
 func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string, generation uint64) (physicalClaudeAuth, bool) {
+	bound, _, ok := c.bindRevisionForIncarnation(auth, revision, generation, 0)
+	return bound, ok
+}
+
+func (c *quotaCache) bindRevisionForIncarnation(auth physicalClaudeAuth, revision string, generation, expectedIncarnation uint64) (physicalClaudeAuth, uint64, bool) {
 	if revision == "" {
-		return physicalClaudeAuth{}, false
+		return physicalClaudeAuth{}, 0, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
-	if !ok || sample.Identity != auth.Identity || sample.ObservedGeneration != generation {
-		return physicalClaudeAuth{}, false
+	if !ok || sample.Identity != auth.Identity || sample.ObservedGeneration != generation || expectedIncarnation != 0 && sample.Incarnation != expectedIncarnation {
+		return physicalClaudeAuth{}, 0, false
 	}
 	if sample.Revision != "" && sample.Revision != revision {
 		c.nextIncarnation++
@@ -339,7 +461,7 @@ func (c *quotaCache) bindRevision(auth physicalClaudeAuth, revision string, gene
 	sample.Revision = revision
 	c.samples[auth.ID] = sample
 	auth.Revision = revision
-	return auth, true
+	return auth, sample.Incarnation, true
 }
 
 func (c *quotaCache) observedGeneration(auth physicalClaudeAuth) (uint64, bool) {
@@ -347,6 +469,13 @@ func (c *quotaCache) observedGeneration(auth physicalClaudeAuth) (uint64, bool) 
 	defer c.mu.Unlock()
 	sample, ok := c.samples[auth.ID]
 	return sample.ObservedGeneration, ok && sample.Identity == auth.Identity
+}
+
+func (c *quotaCache) bindingSnapshot(auth physicalClaudeAuth) (uint64, uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.samples[auth.ID]
+	return s.ObservedGeneration, s.Incarnation, ok && s.Identity == auth.Identity
 }
 
 func sampleMatchesAuth(sample quotaSample, auth physicalClaudeAuth) bool {
@@ -367,6 +496,9 @@ func (c *quotaCache) recordSuccess(authID string, percentUsed float64, resetAt, 
 	sample.SampledAt = sampledAt
 	sample.LastAttemptAt = sampledAt
 	sample.ResetAt = resetAt
+	sample.Windows.FiveHour = quotaWindow{Percent: percentUsed, ResetAt: resetAt, SampledAt: sampledAt, Source: quotaSourceUsage, Valid: true}
+	sample.UsageAttemptAt = sampledAt
+	sample.UsageSuccessAt = sampledAt
 	sample.LastErrorCategory = ""
 	c.samples[authID] = sample
 	c.mu.Unlock()
@@ -384,6 +516,9 @@ func (c *quotaCache) recordSuccessForIdentity(auth physicalClaudeAuth, percentUs
 	sample.SampledAt = sampledAt
 	sample.LastAttemptAt = sampledAt
 	sample.ResetAt = resetAt
+	sample.Windows.FiveHour = quotaWindow{Percent: percentUsed, ResetAt: resetAt, SampledAt: sampledAt, Source: quotaSourceUsage, Valid: true}
+	sample.UsageAttemptAt = sampledAt
+	sample.UsageSuccessAt = sampledAt
 	sample.LastErrorCategory = ""
 	c.samples[auth.ID] = sample
 	return true
@@ -406,6 +541,12 @@ func (c *quotaCache) recordSuccessForGeneration(auth physicalClaudeAuth, generat
 	}
 	sample.HasSample, sample.FiveHourPercentUsed, sample.SampledAt = true, percentUsed, sampledAt
 	sample.LastAttemptAt, sample.ResetAt, sample.LastErrorCategory = sampledAt, resetAt, ""
+	window := quotaWindow{Percent: percentUsed, ResetAt: resetAt, SampledAt: sampledAt, Source: quotaSourceUsage, Valid: true}
+	sample.Windows.FiveHour = window
+	sample.UsageAttemptAt = pollStartedAt
+	if sample.UsageSuccessAt.IsZero() || sampledAt.After(sample.UsageSuccessAt) {
+		sample.UsageSuccessAt = sampledAt
+	}
 	c.samples[auth.ID] = sample
 	return true
 }
@@ -443,6 +584,7 @@ func (c *quotaCache) recordHeaderObservation(authID string, generation, incarnat
 	sample.FiveHourPercentUsed = observation.PercentUsed
 	sample.ResetAt = observation.ResetAt
 	sample.SampledAt = observation.ObservedAt
+	sample.Windows.FiveHour = quotaWindow{Percent: observation.PercentUsed, ResetAt: observation.ResetAt, SampledAt: observation.ObservedAt, Source: quotaSourceHeaders, Valid: true}
 	sample.LastErrorCategory = ""
 	c.samples[authID] = sample
 	return true

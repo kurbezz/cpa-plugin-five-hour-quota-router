@@ -125,6 +125,9 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			fallbackCandidate = candidate
 		}
 		if r.cache.isExcluded(candidate.ID, now, cfg.CutoffPercentUsed) {
+			if r.cache.usageRefreshDue(candidate.ID, cfg, now) {
+				r.queueCandidateRefresh(candidate.ID, cfg, now)
+			}
 			blockedCandidates++
 			if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
 				confirmedOverCutoffCount++
