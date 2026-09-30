@@ -1,0 +1,9 @@
+{"Time":"2026-09-30T19:06:40.440229+02:00","Action":"start","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router"}
+{"Time":"2026-09-30T19:06:40.977815+02:00","Action":"run","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Test":"TestCLIProxyAPIProcessModelQuotaEndToEnd"}
+{"Time":"2026-09-30T19:06:40.977882+02:00","Action":"output","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Test":"TestCLIProxyAPIProcessModelQuotaEndToEnd","Output":"=== RUN   TestCLIProxyAPIProcessModelQuotaEndToEnd\n"}
+{"Time":"2026-09-30T19:06:51.949683+02:00","Action":"output","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Test":"TestCLIProxyAPIProcessModelQuotaEndToEnd","Output":"    process_e2e_test.go:479: TASK5_OBSERVED accounts=2 status_windows=five_hour,weekly,fable_weekly healthy_shared=true fable_http=429 retry_after=2280120789 fable_proxy_hits=0 sonnet_proxy_hit_observed=true usage_hits=2\n"}
+{"Time":"2026-09-30T19:06:51.957261+02:00","Action":"output","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Test":"TestCLIProxyAPIProcessModelQuotaEndToEnd","Output":"--- PASS: TestCLIProxyAPIProcessModelQuotaEndToEnd (10.98s)\n"}
+{"Time":"2026-09-30T19:06:51.957288+02:00","Action":"pass","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Test":"TestCLIProxyAPIProcessModelQuotaEndToEnd","Elapsed":10.98}
+{"Time":"2026-09-30T19:06:51.957573+02:00","Action":"output","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Output":"PASS\n"}
+{"Time":"2026-09-30T19:06:51.958089+02:00","Action":"output","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Output":"ok  \tgithub.com/Smarty-Pants-Inc/cpa-plugin-quota-router\t11.518s\n"}
+{"Time":"2026-09-30T19:06:51.958107+02:00","Action":"pass","Package":"github.com/Smarty-Pants-Inc/cpa-plugin-quota-router","Elapsed":11.518}
