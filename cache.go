@@ -17,15 +17,26 @@ type cutoffStatusResponse struct {
 }
 
 type cutoffAccountStatus struct {
-	ID                  string   `json:"id"`
-	AuthIndex           string   `json:"auth_index,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Known               bool     `json:"known"`
-	Blocked             bool     `json:"blocked"`
-	FiveHourPercentUsed *float64 `json:"five_hour_percent_used,omitempty"`
-	SampledAt           string   `json:"sampled_at,omitempty"`
-	ResetAt             string   `json:"reset_at,omitempty"`
-	LastErrorCategory   string   `json:"last_error_category,omitempty"`
+	ID                  string              `json:"id"`
+	AuthIndex           string              `json:"auth_index,omitempty"`
+	Name                string              `json:"name,omitempty"`
+	Known               bool                `json:"known"`
+	Blocked             bool                `json:"blocked"`
+	FiveHourPercentUsed *float64            `json:"five_hour_percent_used,omitempty"`
+	SampledAt           string              `json:"sampled_at,omitempty"`
+	ResetAt             string              `json:"reset_at,omitempty"`
+	LastErrorCategory   string              `json:"last_error_category,omitempty"`
+	Windows             []quotaWindowStatus `json:"windows,omitempty"`
+}
+
+type quotaWindowStatus struct {
+	Scope     string  `json:"scope"`
+	Percent   float64 `json:"percent_used"`
+	ResetAt   string  `json:"reset_at,omitempty"`
+	SampledAt string  `json:"sampled_at,omitempty"`
+	Source    string  `json:"source"`
+	Known     bool    `json:"known"`
+	Blocked   bool    `json:"blocked"`
 }
 
 type quotaSample struct {
@@ -130,6 +141,62 @@ func syncFiveHourCompatibility(sample *quotaSample, w quotaWindow) {
 	sample.FiveHourPercentUsed = w.Percent
 	sample.ResetAt = w.ResetAt
 	sample.SampledAt = w.SampledAt
+}
+
+func sampleQuotaWindows(sample quotaSample) quotaWindowBatch {
+	b := sample.Windows
+	if !b.FiveHour.Valid && sample.HasSample {
+		b.FiveHour = quotaWindow{Percent: sample.FiveHourPercentUsed, ResetAt: sample.ResetAt, SampledAt: sample.SampledAt, Source: quotaSourceUsage, Valid: true}
+	}
+	return b
+}
+
+func (c *quotaCache) candidateDecisions(authIDs []string, model string, now time.Time, cutoff float64) (map[string]quotaDecision, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	family := resolveQuotaModelFamily(model)
+	decisions := make(map[string]quotaDecision, len(authIDs))
+	allExhausted, recoveryKnown := len(authIDs) > 0, true
+	var earliestRecovery time.Time
+	for _, id := range authIDs {
+		sample, ok := c.samples[id]
+		decision := quotaDecision{Excluded: true}
+		if ok {
+			decision = evaluateQuotaDecision(sampleQuotaWindows(sample), family, now, cutoff)
+		}
+		decisions[id] = decision
+		if !decision.ConfirmedExhausted {
+			allExhausted = false
+		}
+		if decision.ConfirmedExhausted {
+			if !decision.RecoveryKnown {
+				recoveryKnown = false
+			} else if earliestRecovery.IsZero() || decision.RecoveryAt.Before(earliestRecovery) {
+				earliestRecovery = decision.RecoveryAt
+			}
+		}
+	}
+	return decisions, earliestRecovery, allExhausted && recoveryKnown && !earliestRecovery.IsZero()
+}
+
+func (c *quotaCache) liveFleetDecision(model string, now time.Time, cutoff float64) (bool, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.samples) == 0 {
+		return false, time.Time{}, false
+	}
+	family := resolveQuotaModelFamily(model)
+	var earliest time.Time
+	for _, sample := range c.samples {
+		d := evaluateQuotaDecision(sampleQuotaWindows(sample), family, now, cutoff)
+		if !d.ConfirmedExhausted || !d.RecoveryKnown {
+			return false, time.Time{}, false
+		}
+		if earliest.IsZero() || d.RecoveryAt.Before(earliest) {
+			earliest = d.RecoveryAt
+		}
+	}
+	return true, earliest, !earliest.IsZero()
 }
 
 func (c *quotaCache) snapshotWindows(authID string) quotaWindowBatch {
@@ -649,6 +716,7 @@ func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStat
 			Blocked:           sample.excluded(now, cutoff),
 			LastErrorCategory: sample.LastErrorCategory,
 		}
+		account.Windows = quotaWindowStatuses(sampleQuotaWindows(sample), now, cutoff)
 		if known {
 			percentUsed := sample.FiveHourPercentUsed
 			account.FiveHourPercentUsed = &percentUsed
@@ -661,4 +729,24 @@ func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStat
 	}
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
 	return accounts
+}
+
+func quotaWindowStatuses(batch quotaWindowBatch, now time.Time, cutoff float64) []quotaWindowStatus {
+	names := []string{"five_hour", "weekly", "fable_weekly", "opus_weekly", "sonnet_weekly"}
+	windows := []quotaWindow{batch.FiveHour, batch.Weekly, batch.FableWeekly, batch.OpusWeekly, batch.SonnetWeekly}
+	out := make([]quotaWindowStatus, 0, len(windows))
+	for i, w := range windows {
+		if !w.Valid {
+			continue
+		}
+		entry := quotaWindowStatus{Scope: names[i], Percent: w.Percent, Source: w.Source, Known: true, Blocked: w.Percent >= cutoff && (w.ResetAt.IsZero() || now.Before(w.ResetAt))}
+		if !w.ResetAt.IsZero() {
+			entry.ResetAt = w.ResetAt.UTC().Format(time.RFC3339Nano)
+		}
+		if !w.SampledAt.IsZero() {
+			entry.SampledAt = w.SampledAt.UTC().Format(time.RFC3339Nano)
+		}
+		out = append(out, entry)
+	}
+	return out
 }

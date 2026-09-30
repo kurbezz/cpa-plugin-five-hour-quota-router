@@ -95,10 +95,17 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		return pluginapi.SchedulerPickResponse{Handled: false}, nil
 	}
 	now := r.now()
+	ids := make([]string, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
+		if (provider == "" || provider == "claude") && candidate.ID != "" && strings.TrimSpace(candidate.ID) == candidate.ID {
+			ids = append(ids, candidate.ID)
+		}
+	}
+	decisions, retryAt, allRecoveryKnown := r.cache.candidateDecisions(ids, req.Model, now, cfg.CutoffPercentUsed)
 	var selected *pluginapi.SchedulerAuthCandidate
 	var fallbackCandidate *pluginapi.SchedulerAuthCandidate
 	claudeCandidates, blockedCandidates, confirmedOverCutoffCount := 0, 0, 0
-	claudeCandidateIDs := make([]string, 0, len(req.Candidates))
 	for i := range req.Candidates {
 		candidate := &req.Candidates[i]
 		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
@@ -109,7 +116,6 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			continue
 		}
 		claudeCandidates++
-		claudeCandidateIDs = append(claudeCandidateIDs, candidate.ID)
 		// Track the preferred overage-fallback candidate across ALL claude
 		// candidates unconditionally, so it's available regardless of which
 		// branch executes below. Tie-break order: highest Priority first
@@ -124,12 +130,13 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 			(candidate.Priority == fallbackCandidate.Priority && candidateWeight(candidate) == candidateWeight(fallbackCandidate) && candidate.ID < fallbackCandidate.ID) {
 			fallbackCandidate = candidate
 		}
-		if r.cache.isExcluded(candidate.ID, now, cfg.CutoffPercentUsed) {
+		decision := decisions[candidate.ID]
+		if decision.Excluded {
 			if r.cache.usageRefreshDue(candidate.ID, cfg, now) {
 				r.queueCandidateRefresh(candidate.ID, cfg, now)
 			}
 			blockedCandidates++
-			if r.cache.isBlocked(candidate.ID, now, cfg.CutoffPercentUsed) {
+			if decision.ConfirmedExhausted {
 				confirmedOverCutoffCount++
 			}
 			continue
@@ -165,8 +172,7 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		// before-auth admission. Keep the safe reset-derived retry metadata on
 		// this error when it is known; the scheduler ABI itself cannot emit an
 		// HTTP Retry-After header.
-		resetAt, hasReset := r.cache.earliestFutureReset(claudeCandidateIDs, now)
-		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, resetAt, hasReset)}
+		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, retryAt, allRecoveryKnown && !retryAt.IsZero())}
 	}
 	return pluginapi.SchedulerPickResponse{Handled: false}, nil
 }

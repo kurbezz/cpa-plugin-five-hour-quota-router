@@ -73,11 +73,18 @@ func (r *pluginRuntime) interceptBeforeAuth(req pluginapi.RequestInterceptReques
 	// after this call captured its own membership; checking that stale list
 	// here could confirm "exhaustion" against membership the cache no longer
 	// holds.
-	resetAt, hasReset := r.cache.confirmedFleetExhaustedReset(now, cfg.CutoffPercentUsed)
-	if !hasReset {
+	allExhausted, resetAt, hasReset := r.cache.liveFleetDecision(beforeAuthModel(req), now, cfg.CutoffPercentUsed)
+	if !allExhausted || !hasReset {
 		return pluginapi.RequestInterceptResponse{}
 	}
 	return r.exhaustedInterceptResponse(now, resetAt, hasReset)
+}
+
+func beforeAuthModel(req pluginapi.RequestInterceptRequest) string {
+	if strings.TrimSpace(req.Model) != "" {
+		return strings.TrimSpace(req.Model)
+	}
+	return strings.TrimSpace(req.RequestedModel)
 }
 
 func (c *quotaCache) usageRefreshDue(authID string, cfg pluginConfig, now time.Time) bool {

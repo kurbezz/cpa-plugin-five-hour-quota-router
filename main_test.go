@@ -1089,7 +1089,8 @@ func TestOverageFallbackNeverTriggersForUnknownCandidate(t *testing.T) {
 	if response.Handled {
 		t.Fatalf("overage fallback must not trigger when any candidate is unknown: response = %#v", response)
 	}
-	wantMessage := "five_hour_quota_exhausted; retry_after_seconds=75; resets_at=2026-09-23T12:01:15Z"
+	// Unknown quota state prevents reliable finite recovery metadata.
+	wantMessage := exhaustedErrorCode
 	if decisionError == nil || decisionError.Code != exhaustedErrorCode || decisionError.Message != wantMessage {
 		t.Fatalf("expected hard-blocked exhausted error when a candidate is unknown, got error = %#v", decisionError)
 	}
@@ -2480,6 +2481,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	allowedKeys := map[string]bool{
 		"id": true, "auth_index": true, "name": true, "known": true, "blocked": true,
 		"five_hour_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
+		"windows": true,
 	}
 	for _, rawAccount := range rawAccounts {
 		account, okAccount := rawAccount.(map[string]any)
