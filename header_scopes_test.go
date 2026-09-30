@@ -38,3 +38,40 @@ func TestHeaderWindows(t *testing.T) {
 		t.Fatalf("low no-reset header: %+v", w)
 	}
 }
+
+func TestHeaderWindowsIndependentAndRejected(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h := http.Header{
+		"Anthropic-Ratelimit-Unified-5h-Utilization":    {"0.99"},
+		"Anthropic-Ratelimit-Unified-5h-Status":         {"rejected"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":          {"bad"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization":    {"0.2"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":          {"4102444800"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Utilization": {"0.98"},
+	}
+	b := parseClaudeQuotaHeaders(h, "claude-fable-5", now, 95)
+	if b.FiveHour.Valid || !b.Weekly.Valid || b.Weekly.Percent != 20 || b.FableWeekly.Valid {
+		t.Fatalf("independent parse %+v", b)
+	}
+	h.Set("Anthropic-Ratelimit-Unified-5h-Reset", "4102444800")
+	b = parseClaudeQuotaHeaders(h, "claude-fable-5", now, 95)
+	if !b.FiveHour.Valid || b.FiveHour.Percent != 100 {
+		t.Fatalf("rejected parse %+v", b.FiveHour)
+	}
+	h.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.99")
+	h.Del("Anthropic-Ratelimit-Unified-7d-Reset")
+	b = parseClaudeQuotaHeaders(h, "claude-fable-5", now, 95)
+	if b.Weekly.Valid || !b.FiveHour.Valid {
+		t.Fatalf("high weekly missing reset not isolated: %+v", b)
+	}
+	h.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.5")
+	b = parseClaudeQuotaHeaders(h, "claude-fable-5", now, 95)
+	if !b.Weekly.Valid || !b.Weekly.ResetAt.IsZero() {
+		t.Fatalf("low weekly missing reset: %+v", b.Weekly)
+	}
+	for _, model := range []string{"claude-opus-4-1", "claude-sonnet-4-6", "custom-chat", "claude-opus-sonnet"} {
+		if parseClaudeQuotaHeaders(h, model, now, 95).FableWeekly.Valid {
+			t.Errorf("7d_oi applied to %s", model)
+		}
+	}
+}

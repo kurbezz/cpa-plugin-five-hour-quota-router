@@ -28,7 +28,16 @@ func newHTTPUsageFetcher(endpoint string, transport http.RoundTripper, userAgent
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	return httpUsageFetcher{endpoint: endpoint, userAgent: userAgent, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return httpUsageFetcher{
+		endpoint:  endpoint,
+		userAgent: userAgent,
+		client: &http.Client{
+			Transport: transport,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
 }
 func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.Duration) (usageResult, string) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -57,11 +66,11 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		switch resp.StatusCode {
-		case 401:
+		case http.StatusUnauthorized:
 			return usageResult{}, pollErrorUnauthorized
-		case 403:
+		case http.StatusForbidden:
 			return usageResult{}, pollErrorForbidden
-		case 429:
+		case http.StatusTooManyRequests:
 			return usageResult{}, pollErrorRateLimited
 		default:
 			if resp.StatusCode >= 500 {
@@ -72,13 +81,14 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUsageResponseBytes+1))
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, context.Canceled):
 			return usageResult{}, pollErrorCancelled
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
+		case errors.Is(err, context.DeadlineExceeded):
 			return usageResult{}, pollErrorTimeout
+		default:
+			return usageResult{}, pollErrorRead
 		}
-		return usageResult{}, pollErrorRead
 	}
 	if len(body) > maxUsageResponseBytes {
 		return usageResult{}, pollErrorBodyTooLarge
@@ -222,10 +232,13 @@ func parseUsageWindowValue(percentRaw, resetRaw json.RawMessage) (quotaWindow, b
 	return quotaWindow{Percent: p, ResetAt: reset, Source: quotaSourceUsage, Valid: true}, true
 }
 func conservativeWindow(a, b quotaWindow) quotaWindow {
+	resetMissing := a.ResetAt.IsZero() || b.ResetAt.IsZero()
 	if b.Percent > a.Percent {
 		a.Percent = b.Percent
 	}
-	if b.ResetAt.After(a.ResetAt) {
+	if resetMissing {
+		a.ResetAt = time.Time{}
+	} else if b.ResetAt.After(a.ResetAt) {
 		a.ResetAt = b.ResetAt
 	}
 	return a
