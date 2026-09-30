@@ -5,3 +5,4 @@
 *.h
 /cpa-plugin-quota-router
 /five-hour-quota-router
+/.superpowers/
