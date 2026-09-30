@@ -19,6 +19,44 @@ type headerObservation struct {
 	Valid       bool
 }
 
+const quotaSourceHeaders = "headers"
+
+// parseClaudeQuotaHeaders parses the bounded supported header windows.
+func parseClaudeQuotaHeaders(headers http.Header, model string, observedAt time.Time, cutoff float64) quotaWindowBatch {
+	var batch quotaWindowBatch
+	read := func(window string) quotaWindow {
+		prefix := "Anthropic-Ratelimit-Unified-" + window + "-"
+		rejected := strings.EqualFold(strings.TrimSpace(headers.Get(prefix+"Status")), "rejected")
+		var percent float64
+		have := false
+		if raw := strings.TrimSpace(headers.Get(prefix + "Utilization")); raw != "" {
+			if fraction, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(fraction) && !math.IsInf(fraction, 0) && fraction >= 0 {
+				percent, have = math.Min(100, fraction*100), true
+			}
+		}
+		if rejected {
+			percent, have = 100, true
+		}
+		if !have {
+			return quotaWindow{}
+		}
+		reset, _ := parseClaudeHeaderResetTime(strings.TrimSpace(headers.Get(prefix + "Reset")))
+		if percent >= cutoff && reset.IsZero() {
+			return quotaWindow{}
+		}
+		return quotaWindow{Percent: percent, ResetAt: reset, SampledAt: observedAt, Source: quotaSourceHeaders, Valid: true}
+	}
+	if headers == nil {
+		return batch
+	}
+	batch.FiveHour = read("5h")
+	batch.Weekly = read("7d")
+	if resolveQuotaModelFamily(model) == quotaFamilyFable {
+		batch.FableWeekly = read("7d_oi")
+	}
+	return batch
+}
+
 // parseClaudeFiveHourHeaders extracts Anthropic's unified five-hour rate-limit
 // headers from a successful upstream response.
 //
