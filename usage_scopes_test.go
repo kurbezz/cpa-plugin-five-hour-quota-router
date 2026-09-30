@@ -97,6 +97,56 @@ func TestUsageLegacyWindowsAndPrecedence(t *testing.T) {
 	}
 }
 
+func TestUsageWindowsDuplicates(t *testing.T) {
+	known1 := "2099-01-02T00:00:00Z"
+	known2 := "2099-01-04T00:00:00Z"
+	unknown := `{"kind":"weekly_all","percent":99,"resets_at":null}`
+	known := `{"kind":"weekly_all","percent":20,"resets_at":"` + known2 + `"}`
+	fable := `{"kind":"weekly_scoped","percent":44,"resets_at":"2099-01-06T00:00:00Z","scope":{"model":{"id":"fable","display_name":"Fable"}}}`
+
+	for _, tc := range []struct {
+		name, limits string
+		percent      float64
+		reset        time.Time
+		unknownReset bool
+	}{
+		{"known order one", `[{"kind":"weekly_all","percent":99,"resets_at":"` + known1 + `"},` + known + `,` + fable + `]`, 99, time.Date(2099, 1, 4, 0, 0, 0, 0, time.UTC), false},
+		{"known order two", `[` + known + `,{"kind":"weekly_all","percent":99,"resets_at":"` + known1 + `"},` + fable + `]`, 99, time.Date(2099, 1, 4, 0, 0, 0, 0, time.UTC), false},
+		{"unknown then known", `[` + unknown + `,` + known + `,` + fable + `]`, 99, time.Time{}, true},
+		{"known then unknown", `[` + known + `,` + unknown + `,` + fable + `]`, 99, time.Time{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"},"limits":` + tc.limits + `}`
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer server.Close()
+			result, err := newHTTPUsageFetcher(server.URL, server.Client().Transport, "").fetch(context.Background(), "fake", time.Second)
+			if err != "" {
+				t.Fatalf("fetch error %q", err)
+			}
+			batch := result.Windows
+			if !batch.FiveHour.Valid || batch.FiveHour.Percent != 10 || !batch.Weekly.Valid || batch.Weekly.Percent != tc.percent || batch.Weekly.Source != quotaSourceUsage {
+				t.Fatalf("shared windows: %+v", batch)
+			}
+			if tc.unknownReset {
+				if !batch.Weekly.ResetAt.IsZero() {
+					t.Fatalf("unknown reset became %s", batch.Weekly.ResetAt)
+				}
+			} else if !batch.Weekly.ResetAt.Equal(tc.reset) {
+				t.Fatalf("reset %s want %s", batch.Weekly.ResetAt, tc.reset)
+			}
+			if !batch.FableWeekly.Valid || batch.FableWeekly.Percent != 44 || !batch.FableWeekly.ResetAt.Equal(time.Date(2099, 1, 6, 0, 0, 0, 0, time.UTC)) || batch.OpusWeekly.Valid || batch.SonnetWeekly.Valid {
+				t.Fatalf("scope-local merge: %+v", batch)
+			}
+			if tc.unknownReset {
+				d := evaluateQuotaDecision(batch, quotaFamilyUnknown, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), 95)
+				if !d.Excluded || !d.ConfirmedExhausted || d.RecoveryKnown || !d.RecoveryAt.IsZero() {
+					t.Fatalf("decision for unknown reset: %+v", d)
+				}
+			}
+		})
+	}
+}
+
 func assertUsageWindow(t *testing.T, w quotaWindow, percent float64, day int) {
 	t.Helper()
 	if !w.Valid || w.Percent != percent || w.Source != quotaSourceUsage {
