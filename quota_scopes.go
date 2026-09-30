@@ -42,14 +42,17 @@ func resolveQuotaModelFamily(model string) quotaModelFamily {
 }
 
 func resolveQuotaScopeFamily(id, display string) quotaModelFamily {
-	a, b := resolveQuotaModelFamily(id), resolveQuotaModelFamily(display)
-	if a != quotaFamilyUnknown && b != quotaFamilyUnknown && a != b {
+	all := familyTokens(id)
+	for family := range familyTokens(display) {
+		all[family] = true
+	}
+	if len(all) != 1 {
 		return quotaFamilyUnknown
 	}
-	if a != quotaFamilyUnknown {
-		return a
+	for family := range all {
+		return family
 	}
-	return b
+	return quotaFamilyUnknown
 }
 
 type quotaWindow struct {
@@ -77,12 +80,9 @@ func evaluateQuotaDecision(batch quotaWindowBatch, family quotaModelFamily, now 
 		windows = append(windows, batch.SonnetWeekly)
 	}
 	var d quotaDecision
-	blocking, unknownReset := false, false
-	for i, w := range windows {
+	blocking, allBlockingResetsKnown := false, true
+	for _, w := range windows {
 		if !w.Valid {
-			if i == 0 {
-				unknownReset = true
-			}
 			continue
 		}
 		if w.Percent < cutoff {
@@ -93,13 +93,16 @@ func evaluateQuotaDecision(batch quotaWindowBatch, family quotaModelFamily, now 
 		}
 		blocking = true
 		if w.ResetAt.IsZero() {
-			unknownReset = true
+			allBlockingResetsKnown = false
 		} else if w.ResetAt.After(d.RecoveryAt) {
 			d.RecoveryAt = w.ResetAt
 		}
 	}
 	d.Excluded = blocking || !batch.FiveHour.Valid
-	d.ConfirmedExhausted = blocking && !unknownReset
-	d.RecoveryKnown = d.ConfirmedExhausted && !d.RecoveryAt.IsZero()
+	d.ConfirmedExhausted = batch.FiveHour.Valid && blocking
+	d.RecoveryKnown = d.ConfirmedExhausted && allBlockingResetsKnown && !d.RecoveryAt.IsZero()
+	if !d.RecoveryKnown {
+		d.RecoveryAt = time.Time{}
+	}
 	return d
 }
