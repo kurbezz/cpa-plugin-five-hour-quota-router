@@ -156,7 +156,7 @@ func TestBindingIncarnationGuardsWindows(t *testing.T) {
 	if windows := c.snapshotWindows(a.ID); windows.FiveHour.Valid || windows.Weekly.Valid || windows.FableWeekly.Valid || windows.OpusWeekly.Valid || windows.SonnetWeekly.Valid {
 		t.Fatalf("revision replacement retained quota windows: %+v", windows)
 	}
-	if c.commitWindowBatch(bound, g, ownInc, seed, now.Add(time.Second), now, true) {
+	if c.commitWindowBatch(bound, g, original, seed, now.Add(time.Second), now, true) {
 		t.Fatal("later replacement accepted old in-flight batch")
 	}
 	// Remove/re-add with the same ID and identity is still a distinct incarnation.
