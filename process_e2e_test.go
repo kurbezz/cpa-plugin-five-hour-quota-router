@@ -31,6 +31,7 @@ const (
 var e2eUsageHits atomic.Int64
 
 const e2eProtectedModel = "claude-opus-4-1-20250805"
+const e2eFableModel = "claude-fable-5-1"
 
 func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +315,165 @@ drainProxyHits:
 		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
 	}
 	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
+}
+
+func TestCLIProxyAPIProcessModelQuotaEndToEnd(t *testing.T) {
+	e2eUsageHits.Store(0)
+	usageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e2eUsageHits.Add(1)
+		fable := 20
+		switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		case "model-e2e-token-a":
+			fable = 96
+		case "model-e2e-token-b":
+			fable = 99
+		default:
+			http.Error(w, "unknown synthetic token", http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":20,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2099-01-01T00:00:00Z"},"seven_day_fable":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, fable)
+	}))
+	defer usageServer.Close()
+	proxyHits := make(chan string, 8)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case proxyHits <- r.Method + " " + r.Host:
+		default:
+		}
+		http.Error(w, "synthetic local proxy rejection", http.StatusBadGateway)
+	}))
+	defer proxyServer.Close()
+	dir := t.TempDir()
+	root := cliProxyAPIModuleDir(t)
+	pluginDir, authDir := filepath.Join(dir, "plugins"), filepath.Join(dir, "auth")
+	if err := os.MkdirAll(pluginDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	extension, serverName := ".so", "cliproxyapi"
+	switch runtime.GOOS {
+	case "darwin":
+		extension = ".dylib"
+	case "windows":
+		extension, serverName = ".dll", "cliproxyapi.exe"
+	}
+	pluginPath := filepath.Join(pluginDir, pluginName+extension)
+	cmd := exec.Command("go", "build", "-buildmode=c-shared", "-ldflags", "-X=main.usageEndpoint="+usageServer.URL, "-o", pluginPath, ".")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build plugin: %v\n%s", err, out)
+	}
+	serverPath := filepath.Join(dir, serverName)
+	cmd = exec.Command("go", "build", "-o", serverPath, "./cmd/server")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build CLIProxyAPI: %v\n%s", err, out)
+	}
+	for i, token := range []string{"model-e2e-token-a", "model-e2e-token-b"} {
+		body := fmt.Sprintf(`{"type":"claude","email":"synthetic-%d@example.test","access_token":%q,"refresh_token":"fixture","expired":"2099-01-01T00:00:00Z"}`, i, token)
+		if err := os.WriteFile(filepath.Join(authDir, fmt.Sprintf("model-%d.json", i)), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	port := unusedTCPPort(t)
+	configPath := filepath.Join(dir, "config.yaml")
+	config := fmt.Sprintf("host: %q\nport: %d\nproxy-url: %q\nauth-dir: %q\napi-keys: [%q]\nremote-management:\n  allow-remote: false\n  secret-key: %q\n  disable-control-panel: true\n  disable-auto-update-panel: true\nlogging-to-file: false\ndebug: false\ndisable-cooling: true\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    five-hour-quota-router:\n      enabled: true\n      priority: 100\n      protected-models: [%q, %q]\n      cutoff-percent-used: 95\n      poll-interval: 1m\n      request-timeout: 2s\n      overage-fallback-enabled: false\n", "127.0.0.1", port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir, e2eFableModel, "claude-sonnet-4-6")
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(serverPath, "-config", configPath, "-local-model")
+	server.Dir = root
+	server.Stdout, server.Stderr = logFile, logFile
+	server.Env = append(os.Environ(), "HOME="+filepath.Join(dir, "home"), "HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY=127.0.0.1,localhost")
+	if err := server.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var processErr error
+	go func() { processErr = server.Wait(); close(done) }()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			_ = server.Process.Kill()
+			<-done
+		}
+		_ = logFile.Close()
+	})
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	status := waitForProcessStatus(t, client, baseURL, done, &processErr, logPath, func(s cutoffStatusResponse) bool {
+		if !s.Enabled || len(s.Accounts) != 2 {
+			return false
+		}
+		for _, a := range s.Accounts {
+			if !a.Known || a.Blocked || a.FiveHourPercentUsed == nil || *a.FiveHourPercentUsed != 20 {
+				return false
+			}
+			found := false
+			for _, w := range a.Windows {
+				if w.Scope == "fable_weekly" && w.Percent >= 95 && w.ResetAt != "" {
+					found = true
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	})
+	waitForProcessModel(t, client, baseURL, done, &processErr, logPath, e2eFableModel)
+	waitForProcessModel(t, client, baseURL, done, &processErr, logPath, "claude-sonnet-4-6")
+	start := time.Now()
+	code, headers, body := postClaudeMessageObserved(t, client, baseURL, e2eFableModel)
+	finish := time.Now()
+	if code != 429 {
+		t.Fatalf("Fable status=%d body=%s", code, body)
+	}
+	var decoded struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil || decoded.Code != exhaustedErrorCode {
+		t.Fatalf("Fable body=%s decoded=%+v err=%v", body, decoded, err)
+	}
+	retry, err := strconv.Atoi(headers.Get("Retry-After"))
+	if err != nil || retry < 1 {
+		t.Fatalf("Retry-After=%q err=%v", headers.Get("Retry-After"), err)
+	}
+	reset, _ := time.Parse(time.RFC3339, "2099-01-01T00:00:00Z")
+	lo := int(math.Ceil(reset.Sub(finish).Seconds()))
+	hi := int(math.Ceil(reset.Sub(start).Seconds())) + 1
+	if retry < lo || retry > hi {
+		t.Fatalf("Retry-After=%d expected %d..%d", retry, lo, hi)
+	}
+	select {
+	case hit := <-proxyHits:
+		t.Fatalf("Fable request hit proxy: %s", hit)
+	default:
+	}
+	sonnet := postClaudeMessage(t, client, baseURL, "claude-sonnet-4-6")
+	if bytes.Contains(sonnet, []byte(exhaustedErrorCode)) {
+		t.Fatalf("Sonnet rejected by Fable-only quota: %s", sonnet)
+	}
+	select {
+	case hit := <-proxyHits:
+		if !strings.Contains(hit, "api.anthropic.com:443") {
+			t.Fatalf("proxy hit=%s", hit)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Sonnet did not reach proxy: %s", sonnet)
+	}
+	if e2eUsageHits.Load() < 2 {
+		t.Fatalf("synthetic usage hits=%d, want at least two", e2eUsageHits.Load())
+	}
+	t.Logf("TASK5_OBSERVED accounts=%d status_windows=five_hour,weekly,fable_weekly healthy_shared=true fable_http=%d retry_after=%d fable_proxy_hits=0 sonnet_proxy_hits=1 usage_hits=%d", len(status.Accounts), code, retry, e2eUsageHits.Load())
 }
 
 func cliProxyAPIModuleDir(t *testing.T) string {

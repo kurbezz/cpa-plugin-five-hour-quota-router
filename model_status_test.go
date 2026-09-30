@@ -11,7 +11,7 @@ func TestModelQuotaStatusWindows(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	const secret = "fixture-token-secret"
 	c := quotaCache{samples: map[string]quotaSample{"acct": {
-		Identity: "identity", Name: "safe-name", HasSample: true, FiveHourPercentUsed: 10,
+		Identity: "fixture-identity-marker", Revision: "fixture-digest-marker", Name: "safe-name", HasSample: true, FiveHourPercentUsed: 10,
 		Windows: quotaWindowBatch{
 			FiveHour:    quotaWindow{Percent: 10, SampledAt: now, Source: quotaSourceUsage, Valid: true},
 			Weekly:      quotaWindow{Percent: 20, SampledAt: now, Source: quotaSourceHeaders, Valid: true},
@@ -24,7 +24,7 @@ func TestModelQuotaStatusWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	if strings.Contains(text, secret) || strings.Contains(text, "identity") || strings.Contains(text, "digest") || strings.Contains(text, "arbitrary_scope") {
+	if strings.Contains(text, secret) || strings.Contains(text, "fixture-identity-marker") || strings.Contains(text, "fixture-digest-marker") || strings.Contains(text, "arbitrary_scope") {
 		t.Fatalf("sensitive/unbounded data in status: %s", text)
 	}
 	var got cutoffStatusResponse
@@ -37,8 +37,13 @@ func TestModelQuotaStatusWindows(t *testing.T) {
 	if len(got.Accounts[0].Windows) != 3 {
 		t.Fatalf("window status missing: %+v", got.Accounts[0])
 	}
+	allowedScopes := map[string]bool{"five_hour": true, "weekly": true, "fable_weekly": true, "opus_weekly": true, "sonnet_weekly": true}
+	allowedSources := map[string]bool{quotaSourceUsage: true, quotaSourceHeaders: true}
 	found := false
 	for _, w := range got.Accounts[0].Windows {
+		if !allowedScopes[w.Scope] || !allowedSources[w.Source] || !w.Known {
+			t.Fatalf("unbounded status scope/source: %+v", w)
+		}
 		if w.Scope == "fable_weekly" {
 			found = true
 			if !w.Blocked || w.Source != quotaSourceUsage {

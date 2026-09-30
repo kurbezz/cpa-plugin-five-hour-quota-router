@@ -98,7 +98,7 @@ func TestModelQuotaAdmissionModelAuthorityAndRecovery(t *testing.T) {
 	}
 }
 
-func TestModelQuotaSharedWeeklyAndOverageUnknown(t *testing.T) {
+func TestModelQuotaSharedWeeklyAndOptionalScope(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	r := newTestRuntime(&fakeHost{}, nil, now)
 	cfg := defaultPluginConfig()
@@ -106,12 +106,10 @@ func TestModelQuotaSharedWeeklyAndOverageUnknown(t *testing.T) {
 	r.config.Store(&cfg)
 	auths := []physicalClaudeAuth{{ID: "a", Identity: "a"}, {ID: "b", Identity: "b"}}
 	r.cache.reconcile(auths)
-	for i, a := range auths {
+	for _, a := range auths {
 		g, inc, _ := r.cache.bindingSnapshot(a)
-		p := float64(96 + i)
 		batch := quotaWindowBatch{FiveHour: quotaWindow{Percent: 10, ResetAt: now.Add(time.Hour), SampledAt: now, Valid: true}, Weekly: quotaWindow{Percent: 99, ResetAt: now.Add(2 * time.Hour), SampledAt: now, Valid: true}}
 		r.cache.commitWindowBatch(a, g, inc, batch, now, time.Time{}, false)
-		_ = p
 	}
 	got, err := r.pick(modelRequest("claude-unknown", candidate("a", 1), candidate("b", 1)))
 	if got.Handled || err == nil {
