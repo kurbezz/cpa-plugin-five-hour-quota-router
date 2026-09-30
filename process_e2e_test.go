@@ -417,13 +417,16 @@ func TestCLIProxyAPIProcessModelQuotaEndToEnd(t *testing.T) {
 			if !a.Known || a.Blocked || a.FiveHourPercentUsed == nil || *a.FiveHourPercentUsed != 20 {
 				return false
 			}
-			found := false
+			found, sharedWeeklyHealthy := false, false
 			for _, w := range a.Windows {
 				if w.Scope == "fable_weekly" && w.Percent >= 95 && w.ResetAt != "" {
 					found = true
 				}
+				if w.Scope == "weekly" && w.Known && w.Percent < 95 && !w.Blocked {
+					sharedWeeklyHealthy = true
+				}
 			}
-			if !found {
+			if !found || !sharedWeeklyHealthy {
 				return false
 			}
 		}
@@ -473,7 +476,7 @@ func TestCLIProxyAPIProcessModelQuotaEndToEnd(t *testing.T) {
 	if e2eUsageHits.Load() < 2 {
 		t.Fatalf("synthetic usage hits=%d, want at least two", e2eUsageHits.Load())
 	}
-	t.Logf("TASK5_OBSERVED accounts=%d status_windows=five_hour,weekly,fable_weekly healthy_shared=true fable_http=%d retry_after=%d fable_proxy_hits=0 sonnet_proxy_hits=1 usage_hits=%d", len(status.Accounts), code, retry, e2eUsageHits.Load())
+	t.Logf("TASK5_OBSERVED accounts=%d status_windows=five_hour,weekly,fable_weekly healthy_shared=true fable_http=%d retry_after=%d fable_proxy_hits=0 sonnet_proxy_hit_observed=true usage_hits=%d", len(status.Accounts), code, retry, e2eUsageHits.Load())
 }
 
 func cliProxyAPIModuleDir(t *testing.T) string {

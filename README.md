@@ -32,13 +32,13 @@ The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `
 - **Applicable windows.** Routing evaluates shared five-hour and shared weekly usage, plus a recognized Fable, Opus, or Sonnet weekly window when the requested model identifies that family. Known exhausted applicable windows exclude that account for that request; a Fable-only limit does not block Sonnet or Opus. Existing priority/weight/AuthID ordering and overage configuration remain in effect.
 - **Usage endpoint.** `/api/oauth/usage` is undocumented. The plugin accepts observed legacy fields (`five_hour`, `seven_day`, and family-specific weekly fields) and newer `limits[]` entries. Scoped limits are recognized only when `scope.model.id` or `scope.model.display_name` identifies a known family; custom aliases are not inferred. Usage utilization is expressed in percentage points.
 - **Fast path for correlated active requests: response headers.** When CLIProxyAPI's after-auth hook correlates a successful Claude request's RequestID to its selected physical OAuth credential, the plugin observes shared `5h-*` and `7d-*` headers, and the `7d_oi-*` family signal only for an identifiable Fable request. Header utilization is a fraction (`0.23` = 23%) and is converted to percent. Partial observations update only supplied windows and do not erase other windows. Missing correlation, unknown/replaced credentials, or unsafe exhausted headers with no reset are ignored. **Only successful responses are observed**; Anthropic error/429 responses are not observed here.
-- **Reliable startup/request-driven source: usage polling.** The worker refreshes enabled physical Claude OAuth credentials on startup. There is no time-driven polling loop. Protected request evaluation can asynchronously queue due refreshes, including excluded accounts with unknown recovery, while routing the current request from cache.
-- Coalesces concurrent refreshes, and does not refresh a known excluded account again before its reported reset time.
+- **Reliable startup/request-driven source: usage polling.** The worker refreshes enabled physical Claude OAuth credentials on startup. There is no time-driven polling loop. Protected request evaluation can asynchronously queue due refreshes, including excluded accounts with unknown recovery, while routing the current request from cache. Known future-reset exhaustion of shared five-hour or weekly windows may suppress redundant polls; model-only exhaustion does not suppress discovery for other scopes.
+- Coalesces concurrent refreshes. A future reset suppresses refresh only when applicable shared windows are exhausted; model-family exhaustion alone does not prevent discovery for other scopes.
 - A rejection-only design cannot enforce a pre-exhaustion cutoff: the rejection arrives only after the hard limit is reached.
 - Applies only to exact, case-insensitive `protected-models` matches; an empty `protected-models` list matches every non-empty Claude model name.
 - Excludes an account at or above `cutoff-percent-used`.
-- **Scheduling exclusion is fail-closed for credentials that have never produced a successful usage sample**: until a poll succeeds at least once for a given credential, it is excluded from protected-model scheduling. This avoids ever routing traffic to an account whose real quota state is unknown.
-- **A credential whose last known reset time has passed is fail-open**: it is trusted to be available again immediately, without waiting for a fresh poll, because Anthropic's five-hour window genuinely rolls over at `resets_at`. This is a narrow, deliberate exception scoped to confirmed window expiry — not a general "unknown quota" fail-open.
+- **Five-hour scheduling exclusion is fail-closed for credentials that have never produced a valid five-hour sample**: that sample can come from a successful usage poll or a valid correlated successful-response header observation.
+- **A window whose known reset has passed no longer blocks on its own**. Other still-active applicable shared or model-family windows may continue to exclude the credential.
 - Never changes auth files or CLIProxyAPI's permanent disabled state.
 - Exposes authenticated status at `GET /v0/management/plugins/five-hour-quota-router/status`.
 
@@ -64,7 +64,7 @@ Note: because `activeRuntime` (and its HTTP fetcher) is constructed once at plug
 
 Management status retains legacy account `blocked` as the five-hour blocked/excluded value and adds bounded per-window scope, utilization, reset/sample times, source, and blocked state. Window-level `blocked` is model-independent and reflects that window's own cutoff/reset; routing applies only relevant scopes.
 
-To restore strict hard-blocking once every account is exhausted (i.e. disable overage billing entirely), set:
+To disable intentional fallback to confirmed-exhausted accounts, set `overage-fallback-enabled: false`. This does not guarantee zero Extra Usage: missing or unrecognized model quotas remain allowed by policy, and quota observations may be incomplete or stale.
 
 ```yaml
 overage-fallback-enabled: false
