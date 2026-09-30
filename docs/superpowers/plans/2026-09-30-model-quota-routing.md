@@ -26,11 +26,11 @@
 
 ## File responsibility map
 
-- Create `quota_windows.go`: bounded scopes, observations, family resolution,
+- Create `quota_scopes.go`: bounded scopes, observations, family resolution,
   pure decision and recovery evaluator.
-- Create `quota_windows_test.go`: parser-independent decision/resolver tests.
+- Create `quota_scopes_test.go`: parser-independent decision/resolver tests.
 - Modify `usage.go`: decode all supported endpoint shapes into a batch.
-- Create `usage_windows_test.go`: httptest parser fixtures, legacy compatibility.
+- Create `usage_scopes_test.go`: httptest parser fixtures, legacy compatibility.
 - Modify `headers.go`: successful-response batch parser, existing 5h compatibility.
 - Modify `cache.go`: per-window storage, guarded merge, coherent decisions,
   independent poll eligibility, compatible status.
