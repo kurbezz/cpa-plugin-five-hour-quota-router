@@ -126,6 +126,35 @@ cannot change headers/body, drop stream chunks, or fail delivery. Successful
 responses only are observable in CPA v7.3.8; upstream errors/429 remain outside
 this hook's coverage.
 
+## Integration invariants from design review
+
+Use five fixed slots (five-hour, shared weekly, Fable weekly, Opus weekly,
+Sonnet weekly), one pure model-aware evaluator, and one guarded batch merge.
+Do not introduce a generic quota registry. Batch validation checks identity,
+revision, generation and incarnation once; timestamp rejection remains per
+window. Capture the bound incarnation for usage polls as well as responses.
+
+Separate the usage attempt/success clock from header freshness. Frequent shared
+headers cannot suppress normal request-driven weekly discovery. Missing optional
+windows never cause unthrottled repeat fetches. Request-driven evaluation must
+also enqueue due refresh for excluded accounts with unknown recovery, even when
+no account is selected. No new autonomous fleet polling is required. Known
+future-reset exhaustion of a shared window may suppress unnecessary fetches;
+model-only exhaustion must not suppress discovery for other models.
+
+The evaluator distinguishes excluded, confirmed exhausted, and known recovery.
+Never-sampled five-hour is excluded but cannot confirm exhaustion. Shared windows
+apply even to requests with unknown family. All blocking windows must have
+future resets to supply finite recovery; healthy window resets are irrelevant.
+Evaluate candidate decisions in one coherent cache snapshot, and admission over
+live membership under one lock.
+
+Conflicting recognized families in scope ID/display name are ambiguous and are
+ignored. The normalized execution `Model` is authoritative when present;
+`RequestedModel` is a fallback only when `Model` is empty. Do not combine or guess
+families from conflicting lifecycle fields. Apply the same family resolver to
+usage scopes, scheduler decisions, admission and response header observations.
+
 ## Verification gates
 
 Use deterministic tests for:
