@@ -1,0 +1,2 @@
+# A unified patch contains intentional context prefixes before Go tabs.
+docs/patches/cpa-v7.3.8-scheduler-retry-after.patch -whitespace
