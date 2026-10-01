@@ -90,6 +90,15 @@ func assertRetryEnvelope(t *testing.T, raw []byte, want int64) {
 		if got.Error.Retry != nil {
 			t.Fatalf("unknown recovery must omit delay: %s", raw)
 		}
+		var fields struct {
+			Error map[string]json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := fields.Error["retry_after_seconds"]; present {
+			t.Fatalf("unknown recovery must omit key, not encode null: %s", raw)
+		}
 	} else if got.Error.Retry == nil || *got.Error.Retry != want {
 		t.Fatalf("want retry_after_seconds=%d, got %s", want, raw)
 	}

@@ -481,6 +481,13 @@ func TestCLIProxyAPIProcessModelQuotaEndToEnd(t *testing.T) {
 
 func cliProxyAPIModuleDir(t *testing.T) string {
 	t.Helper()
+	if override, set := os.LookupEnv("CPA_RETRY_TEST_MODULE_DIR"); set {
+		root, err := validateRetryTestModuleDir(override)
+		if err != nil {
+			t.Fatalf("invalid CPA_RETRY_TEST_MODULE_DIR: %v", err)
+		}
+		return root
+	}
 	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/router-for-me/CLIProxyAPI/v7")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
