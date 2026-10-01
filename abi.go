@@ -52,8 +52,10 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	RetryAfterSeconds *int64 `json:"retry_after_seconds,omitempty"`
 }
 
 //export cliproxy_plugin_init
@@ -129,7 +131,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		response, decisionError := activeRuntime.pick(req)
 		if decisionError != nil {
-			return errorEnvelope(decisionError.Code, decisionError.Message), nil
+			return json.Marshal(envelope{OK: false, Error: decisionError})
 		}
 		return okEnvelope(response)
 	case pluginabi.MethodRequestInterceptBefore:

@@ -305,17 +305,39 @@ func (c *quotaCache) allConfirmedExhausted(authIDs []string, now time.Time, cuto
 	return true
 }
 
-// exhaustedErrorMessage adds safe retry metadata only when a future reset is
-// known. The scheduler ABI has no HTTP status or Retry-After header support.
-func exhaustedErrorMessage(now time.Time, resetAt time.Time, hasReset bool) string {
+// resetRetryAfterSeconds returns a positive ceiling only for a known future
+// reset whose delay can safely be converted back to a time.Duration by the host.
+func resetRetryAfterSeconds(now time.Time, resetAt time.Time, hasReset bool) *int64 {
 	if !hasReset || resetAt.IsZero() || !now.Before(resetAt) {
+		return nil
+	}
+	delay := resetAt.Sub(now)
+	// Sub saturates on overflow. Never turn an unrepresentable difference into
+	// an apparently reliable delay, or lose nanoseconds via floating point.
+	if delay <= 0 || !now.Add(delay).Equal(resetAt) {
+		return nil
+	}
+	seconds := int64(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	if seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) {
+		return nil
+	}
+	return &seconds
+}
+
+// exhaustedErrorMessage preserves legacy text using the same ceiling rule as
+// the structured scheduler error, without parsing message metadata.
+func exhaustedErrorMessage(now time.Time, resetAt time.Time, hasReset bool) string {
+	return exhaustedErrorMessageWithRetry(resetAt, resetRetryAfterSeconds(now, resetAt, hasReset))
+}
+
+func exhaustedErrorMessageWithRetry(resetAt time.Time, retryAfterSeconds *int64) string {
+	if retryAfterSeconds == nil {
 		return exhaustedErrorCode
 	}
-	retryAfterSeconds := int64(math.Ceil(resetAt.Sub(now).Seconds()))
-	if retryAfterSeconds < 1 {
-		retryAfterSeconds = 1
-	}
-	return fmt.Sprintf("%s; retry_after_seconds=%d; resets_at=%s", exhaustedErrorCode, retryAfterSeconds, resetAt.UTC().Format(time.RFC3339))
+	return fmt.Sprintf("%s; retry_after_seconds=%d; resets_at=%s", exhaustedErrorCode, *retryAfterSeconds, resetAt.UTC().Format(time.RFC3339))
 }
 
 func (c *quotaCache) empty() bool {

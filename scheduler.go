@@ -170,9 +170,15 @@ func (r *pluginRuntime) pick(req pluginapi.SchedulerPickRequest) (pluginapi.Sche
 		}
 		// This is the scheduler-level backstop for state that changes after
 		// before-auth admission. Keep the safe reset-derived retry metadata on
-		// this error when it is known; the scheduler ABI itself cannot emit an
-		// HTTP Retry-After header.
-		return pluginapi.SchedulerPickResponse{}, &envelopeError{Code: exhaustedErrorCode, Message: exhaustedErrorMessage(now, retryAt, allRecoveryKnown && !retryAt.IsZero())}
+		// this error when it is known. Updated hosts can convert the optional
+		// structured delay to Retry-After; stock hosts still consume HTTP 429.
+		retryAfterSeconds := resetRetryAfterSeconds(now, retryAt, allRecoveryKnown)
+		return pluginapi.SchedulerPickResponse{}, &envelopeError{
+			Code:              exhaustedErrorCode,
+			Message:           exhaustedErrorMessageWithRetry(retryAt, retryAfterSeconds),
+			HTTPStatus:        http.StatusTooManyRequests,
+			RetryAfterSeconds: retryAfterSeconds,
+		}
 	}
 	return pluginapi.SchedulerPickResponse{Handled: false}, nil
 }
