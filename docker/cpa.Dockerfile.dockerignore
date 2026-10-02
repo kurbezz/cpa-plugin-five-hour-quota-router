@@ -1,0 +1,10 @@
+**
+!go.mod
+!go.sum
+!*.go
+!docs/
+!docs/patches/
+!docs/patches/cpa-v8.0.2-scheduler-retry-after.patch
+!docker/
+!docker/tests/
+!docker/tests/verify-image.py
