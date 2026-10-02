@@ -1,0 +1,643 @@
+diff --git a/internal/pluginhost/rpc_client.go b/internal/pluginhost/rpc_client.go
+index 96e3785..0e61405 100644
+--- a/internal/pluginhost/rpc_client.go
++++ b/internal/pluginhost/rpc_client.go
+@@ -6,8 +6,10 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"net/http"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+@@ -44,9 +46,10 @@ type rpcQuotaProvider struct {
+ }
+ 
+ type rpcError struct {
+-	Code       string
+-	message    string
+-	statusCode int
++	Code              string
++	message           string
++	statusCode        int
++	retryAfterSeconds int64
+ }
+ 
+ func (e rpcError) Error() string {
+@@ -57,6 +60,10 @@ func (e rpcError) StatusCode() int {
+ 	return e.statusCode
+ }
+ 
++func (e rpcError) RetryAfterSeconds() int64 {
++	return e.retryAfterSeconds
++}
++
+ type rpcResponseNormalizer struct {
+ 	*rpcPluginAdapter
+ 	method string
+@@ -365,10 +372,16 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
+ 			if message == "" {
+ 				message = "plugin call failed"
+ 			}
++			var retryAfterSeconds int64
++			if seconds := envelope.Error.RetryAfterSeconds; seconds != nil &&
++				*seconds > 0 && *seconds <= math.MaxInt64/int64(time.Second) {
++				retryAfterSeconds = *seconds
++			}
+ 			return zero, rpcError{
+-				Code:       strings.TrimSpace(envelope.Error.Code),
+-				message:    message,
+-				statusCode: envelope.Error.HTTPStatus,
++				Code:              strings.TrimSpace(envelope.Error.Code),
++				message:           message,
++				statusCode:        envelope.Error.HTTPStatus,
++				retryAfterSeconds: retryAfterSeconds,
+ 			}
+ 		}
+ 		return zero, fmt.Errorf("plugin call failed")
+diff --git a/internal/pluginhost/rpc_retry_after_test.go b/internal/pluginhost/rpc_retry_after_test.go
+new file mode 100644
+index 0000000..541d828
+--- /dev/null
++++ b/internal/pluginhost/rpc_retry_after_test.go
+@@ -0,0 +1,62 @@
++package pluginhost
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"testing"
++
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
++)
++
++func TestCallPluginRetryAfter(t *testing.T) {
++	for _, tc := range []struct{ value, want string }{
++		{"17", "17"}, {"9223372036", "9223372036"}, {"", ""}, {"null", ""}, {"0", ""}, {"-1", ""},
++		{"9223372037", ""}, {"9223372036854775808", ""}, {`"17"`, ""}, {"17.0", ""}, {"1.5", ""}, {"true", ""}, {"{}", ""}, {"[]", ""},
++	} {
++		t.Run("value="+tc.value, func(t *testing.T) {
++			raw := `{"ok":false,"error":{"code":"quota","message":"exhausted","http_status":429`
++			if tc.value != "" {
++				raw += `,"retry_after_seconds":` + tc.value
++			}
++			raw += "}}"
++			_, err := callPlugin[rpcEmptyResponse](context.Background(), staticEnvelopePluginClient{raw: []byte(raw)}, pluginabi.MethodSchedulerPick, rpcEmptyResponse{})
++			var carrier interface {
++				StatusCode() int
++				RetryAfterSeconds() int64
++			}
++			if !errors.As(err, &carrier) {
++				t.Fatalf("missing narrow contract: %T %v", err, err)
++			}
++			if carrier.StatusCode() != 429 || err.Error() != "exhausted" {
++				t.Fatalf("lost status/message: %v", err)
++			}
++			if got := coreauth.SafeResponseHeaders(fmt.Errorf("wrapped: %w", err)).Get("Retry-After"); got != tc.want {
++				t.Fatalf("Retry-After = %q, want %q", got, tc.want)
++			}
++			if !isPluginErrorEnvelope([]byte(raw)) {
++				t.Fatal("error envelope not recognized")
++			}
++		})
++	}
++}
++
++func TestDecodeEnvelopeResultRetryAfterBounds(t *testing.T) {
++	for _, seconds := range []int64{0, -1, 17, 9223372036, 9223372037} {
++		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
++			_, err := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{Error: &pluginabi.Error{HTTPStatus: 429, RetryAfterSeconds: &seconds}})
++			var carrier interface{ RetryAfterSeconds() int64 }
++			if !errors.As(err, &carrier) {
++				t.Fatalf("missing retry carrier: %v", err)
++			}
++			want := int64(0)
++			if seconds > 0 && seconds <= 9223372036 {
++				want = seconds
++			}
++			if got := carrier.RetryAfterSeconds(); got != want {
++				t.Fatalf("seconds=%d want=%d", got, want)
++			}
++		})
++	}
++}
+diff --git a/sdk/api/handlers/claude/plugin_retry_after_test.go b/sdk/api/handlers/claude/plugin_retry_after_test.go
+new file mode 100644
+index 0000000..3d6f656
+--- /dev/null
++++ b/sdk/api/handlers/claude/plugin_retry_after_test.go
+@@ -0,0 +1,84 @@
++package claude
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
++)
++
++type structuredQuotaError struct{}
++
++func (structuredQuotaError) Error() string            { return "scheduler exhausted" }
++func (structuredQuotaError) StatusCode() int          { return 429 }
++func (structuredQuotaError) RetryAfterSeconds() int64 { return 17 }
++
++type structuredQuotaExecutor struct {
++	claudeQuotaExecutorBase
++}
++
++func (*structuredQuotaExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, fmt.Errorf("wrapped: %w", structuredQuotaError{})
++}
++func (*structuredQuotaExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	return nil, fmt.Errorf("wrapped: %w", structuredQuotaError{})
++}
++
++func TestMessagesHandlerPluginRetryAfterBeforeFirstFrame(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, stream := range []bool{false, true} {
++		t.Run(fmt.Sprint(stream), func(t *testing.T) {
++			executor := &structuredQuotaExecutor{}
++			manager := coreauth.NewManager(nil, nil, nil)
++			manager.RegisterExecutor(executor)
++			auth := &coreauth.Auth{ID: "structured-quota-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
++			if _, err := manager.Register(context.Background(), auth); err != nil {
++				t.Fatal(err)
++			}
++			const model = "structured-quota-model"
++			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
++			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
++			if handlers.PassthroughHeadersEnabled(base.Cfg) {
++				t.Fatal("passthrough must default false")
++			}
++			router := gin.New()
++			router.POST("/v1/messages", NewClaudeCodeAPIHandler(base).ClaudeMessages)
++			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"hi"}],"stream":%t}`, model, stream)))
++			req.Header.Set("Content-Type", "application/json")
++			w := httptest.NewRecorder()
++			router.ServeHTTP(w, req)
++			if w.Code != 429 || w.Header().Get("Retry-After") != "17" {
++				t.Fatalf("status=%d headers=%v body=%s", w.Code, w.Header(), w.Body)
++			}
++			if !strings.Contains(w.Body.String(), "scheduler exhausted") {
++				t.Fatalf("lost message: %s", w.Body)
++			}
++			if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") || strings.Contains(w.Body.String(), "data:") {
++				t.Fatalf("initial error must precede SSE: headers=%v body=%s", w.Header(), w.Body)
++			}
++		})
++	}
++}
++
++type claudeQuotaExecutorBase struct{}
++
++func (*claudeQuotaExecutorBase) Identifier() string { return "claude-quota-test" }
++func (*claudeQuotaExecutorBase) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
++	return auth, nil
++}
++func (*claudeQuotaExecutorBase) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, nil
++}
++func (*claudeQuotaExecutorBase) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
++	return nil, fmt.Errorf("unexpected HTTP request")
++}
+diff --git a/sdk/api/handlers/openai/plugin_retry_after_test.go b/sdk/api/handlers/openai/plugin_retry_after_test.go
+new file mode 100644
+index 0000000..8624530
+--- /dev/null
++++ b/sdk/api/handlers/openai/plugin_retry_after_test.go
+@@ -0,0 +1,71 @@
++package openai
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
++)
++
++type structuredQuotaError struct{}
++
++func (structuredQuotaError) Error() string            { return "scheduler exhausted" }
++func (structuredQuotaError) StatusCode() int          { return 429 }
++func (structuredQuotaError) RetryAfterSeconds() int64 { return 17 }
++
++type structuredQuotaExecutor struct {
++	prematureResponsesStreamExecutor
++}
++
++func (*structuredQuotaExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, fmt.Errorf("wrapped: %w", structuredQuotaError{})
++}
++func (*structuredQuotaExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	return nil, fmt.Errorf("wrapped: %w", structuredQuotaError{})
++}
++
++func TestResponsesHandlerPluginRetryAfterBeforeFirstFrame(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	for _, stream := range []bool{false, true} {
++		t.Run(fmt.Sprint(stream), func(t *testing.T) {
++			executor := &structuredQuotaExecutor{}
++			manager := coreauth.NewManager(nil, nil, nil)
++			manager.RegisterExecutor(executor)
++			auth := &coreauth.Auth{ID: "structured-quota-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
++			if _, err := manager.Register(context.Background(), auth); err != nil {
++				t.Fatal(err)
++			}
++			const model = "structured-quota-model"
++			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
++			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
++			if handlers.PassthroughHeadersEnabled(base.Cfg) {
++				t.Fatal("passthrough must default false")
++			}
++			router := gin.New()
++			router.POST("/v1/responses", NewOpenAIResponsesAPIHandler(base).Responses)
++			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":%q,"input":"hi","stream":%t}`, model, stream)))
++			req.Header.Set("Content-Type", "application/json")
++			w := httptest.NewRecorder()
++			router.ServeHTTP(w, req)
++			if w.Code != 429 || w.Header().Get("Retry-After") != "17" {
++				t.Fatalf("status=%d headers=%v body=%s", w.Code, w.Header(), w.Body)
++			}
++			if !strings.Contains(w.Body.String(), "scheduler exhausted") {
++				t.Fatalf("lost message: %s", w.Body)
++			}
++			if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") || strings.Contains(w.Body.String(), "data:") {
++				t.Fatalf("initial error must precede SSE: headers=%v body=%s", w.Header(), w.Body)
++			}
++		})
++	}
++}
+diff --git a/sdk/api/handlers/plugin_retry_after_test.go b/sdk/api/handlers/plugin_retry_after_test.go
+new file mode 100644
+index 0000000..7862588
+--- /dev/null
++++ b/sdk/api/handlers/plugin_retry_after_test.go
+@@ -0,0 +1,77 @@
++package handlers
++
++import (
++	"fmt"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++)
++
++type pluginRetryError struct {
++	status  int
++	seconds int64
++}
++
++func (e pluginRetryError) Error() string            { return "scheduler exhausted" }
++func (e pluginRetryError) StatusCode() int          { return e.status }
++func (e pluginRetryError) RetryAfterSeconds() int64 { return e.seconds }
++
++type pluginStatusOverrideError struct {
++	status int
++	cause  error
++}
++
++func (e pluginStatusOverrideError) Error() string   { return e.cause.Error() }
++func (e pluginStatusOverrideError) StatusCode() int { return e.status }
++func (e pluginStatusOverrideError) Unwrap() error   { return e.cause }
++
++func TestWriteErrorResponsePluginRetryAfterStatusOverride(t *testing.T) {
++	for _, status := range []int{500, 403} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			w := httptest.NewRecorder()
++			c, _ := gin.CreateTestContext(w)
++			h := NewBaseAPIHandlers(nil, nil)
++			if PassthroughHeadersEnabled(h.Cfg) {
++				t.Fatal("passthrough must default false")
++			}
++			err := pluginStatusOverrideError{status: status, cause: pluginRetryError{429, 17}}
++			h.WriteErrorResponse(c, executionErrorMessage(err))
++			if w.Code != status || w.Header().Get("Retry-After") != "" {
++				t.Fatalf("outer status %d: actual status=%d headers=%v body=%s", status, w.Code, w.Header(), w.Body)
++			}
++		})
++	}
++}
++
++func TestWriteErrorResponsePluginRetryAfterDefault(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		for _, status := range []int{429, 500} {
++			t.Run(fmt.Sprintf("stream=%t/status=%d", stream, status), func(t *testing.T) {
++				w := httptest.NewRecorder()
++				c, _ := gin.CreateTestContext(w)
++				if stream {
++					c.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
++					c.Request.Header.Set("Accept", "text/event-stream")
++				}
++				h := NewBaseAPIHandlers(nil, nil)
++				if PassthroughHeadersEnabled(h.Cfg) {
++					t.Fatal("passthrough must default false")
++				}
++				err := fmt.Errorf("outer: %w", pluginRetryError{status, 17})
++				h.WriteErrorResponse(c, executionErrorMessage(err))
++				want := ""
++				if status == 429 {
++					want = "17"
++				}
++				if w.Code != status || w.Header().Get("Retry-After") != want {
++					t.Fatalf("status=%d headers=%v body=%s", w.Code, w.Header(), w.Body)
++				}
++				if !strings.Contains(w.Body.String(), "scheduler exhausted") {
++					t.Fatalf("lost message: %s", w.Body)
++				}
++			})
++		}
++	}
++}
+diff --git a/sdk/cliproxy/auth/home_concurrency.go b/sdk/cliproxy/auth/home_concurrency.go
+index 17fc932..e720612 100644
+--- a/sdk/cliproxy/auth/home_concurrency.go
++++ b/sdk/cliproxy/auth/home_concurrency.go
+@@ -4,12 +4,14 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"math"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+ 	"unicode/utf8"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+ )
+ 
+@@ -278,8 +280,8 @@ func verifyAccountedHomeConcurrencyIdentity(tuple homeConcurrencyTuple, auth *Au
+ 	return nil
+ }
+ 
+-// SafeResponseHeaders returns trusted response headers only for concrete
+-// retry/cooldown errors.
++// SafeResponseHeaders returns trusted built-in retry/cooldown headers and the
++// narrow structured retry delay contract for HTTP 429 errors.
+ func SafeResponseHeaders(err error) http.Header {
+ 	var busy *HomeConcurrencyBusyError
+ 	if errors.As(err, &busy) && busy != nil {
+@@ -309,6 +311,19 @@ func SafeResponseHeaders(err error) http.Header {
+ 	if errors.As(err, &unavailable) && unavailable != nil {
+ 		return unavailable.Headers()
+ 	}
++	var retry interface {
++		StatusCode() int
++		RetryAfterSeconds() int64
++	}
++	// Match execution's effective status; a status-only outer wrapper can
++	// override the inner structured retry error's HTTP 429.
++	if clienterror.HTTPStatusFromError(err) == http.StatusTooManyRequests &&
++		errors.As(err, &retry) && retry.StatusCode() == http.StatusTooManyRequests {
++		seconds := retry.RetryAfterSeconds()
++		if seconds > 0 && seconds <= math.MaxInt64/int64(time.Second) {
++			return http.Header{"Retry-After": []string{strconv.FormatInt(seconds, 10)}}
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/sdk/cliproxy/auth/plugin_retry_after_test.go b/sdk/cliproxy/auth/plugin_retry_after_test.go
+new file mode 100644
+index 0000000..52c1bfb
+--- /dev/null
++++ b/sdk/cliproxy/auth/plugin_retry_after_test.go
+@@ -0,0 +1,68 @@
++package auth
++
++import (
++	"fmt"
++	"math"
++	"testing"
++	"time"
++)
++
++type pluginRetryError struct {
++	status  int
++	seconds int64
++}
++
++func (e pluginRetryError) Error() string            { return "quota" }
++func (e pluginRetryError) StatusCode() int          { return e.status }
++func (e pluginRetryError) RetryAfterSeconds() int64 { return e.seconds }
++
++type pluginStatusOverrideError struct {
++	status int
++	cause  error
++}
++
++func (e pluginStatusOverrideError) Error() string   { return e.cause.Error() }
++func (e pluginStatusOverrideError) StatusCode() int { return e.status }
++func (e pluginStatusOverrideError) Unwrap() error   { return e.cause }
++
++func TestSafeResponseHeadersPluginRetryAfterStatusOverride(t *testing.T) {
++	for _, status := range []int{500, 403} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			err := pluginStatusOverrideError{status: status, cause: pluginRetryError{429, 17}}
++			if got := SafeResponseHeaders(err).Get("Retry-After"); got != "" {
++				t.Fatalf("outer status %d must suppress inner 429 retry header, got %q", status, got)
++			}
++		})
++	}
++	if got := SafeResponseHeaders(fmt.Errorf("outer: %w", pluginRetryError{429, 17})).Get("Retry-After"); got != "17" {
++		t.Fatalf("plain wrapping lost 429 retry header: %q", got)
++	}
++}
++
++func TestSafeResponseHeadersPluginRetryAfter(t *testing.T) {
++	max := int64(math.MaxInt64) / int64(time.Second)
++	for _, tc := range []struct {
++		status  int
++		seconds int64
++		want    string
++	}{
++		{429, 17, "17"}, {429, max, fmt.Sprint(max)}, {429, 0, ""}, {429, -1, ""},
++		{429, max + 1, ""}, {429, math.MaxInt64, ""}, {500, 17, ""}, {403, 17, ""},
++	} {
++		for _, wrapped := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%d/%d/wrapped=%t", tc.status, tc.seconds, wrapped), func(t *testing.T) {
++				var err error = pluginRetryError{tc.status, tc.seconds}
++				if wrapped {
++					err = fmt.Errorf("outer: %w", err)
++				}
++				h := SafeResponseHeaders(err)
++				if got := h.Get("Retry-After"); got != tc.want {
++					t.Fatalf("got %q want %q", got, tc.want)
++				}
++				if len(h) > 1 {
++					t.Fatalf("unexpected headers: %v", h)
++				}
++			})
++		}
++	}
++}
+diff --git a/sdk/pluginabi/error_json.go b/sdk/pluginabi/error_json.go
+new file mode 100644
+index 0000000..3a66cb2
+--- /dev/null
++++ b/sdk/pluginabi/error_json.go
+@@ -0,0 +1,28 @@
++package pluginabi
++
++import (
++	"encoding/json"
++	"math"
++	"time"
++)
++
++// UnmarshalJSON treats invalid optional retry metadata as absent, without
++// weakening decoding of the existing error fields or losing HTTPStatus.
++func (e *Error) UnmarshalJSON(data []byte) error {
++	type plainError Error
++	var decoded plainError
++	wire := struct {
++		*plainError
++		RetryAfter json.RawMessage `json:"retry_after_seconds"`
++	}{plainError: &decoded}
++	if err := json.Unmarshal(data, &wire); err != nil {
++		return err
++	}
++	var seconds int64
++	if len(wire.RetryAfter) > 0 && json.Unmarshal(wire.RetryAfter, &seconds) == nil &&
++		seconds > 0 && seconds <= math.MaxInt64/int64(time.Second) {
++		decoded.RetryAfterSeconds = &seconds
++	}
++	*e = Error(decoded)
++	return nil
++}
+diff --git a/sdk/pluginabi/retry_after_test.go b/sdk/pluginabi/retry_after_test.go
+new file mode 100644
+index 0000000..e3cb137
+--- /dev/null
++++ b/sdk/pluginabi/retry_after_test.go
+@@ -0,0 +1,88 @@
++package pluginabi
++
++import (
++	"encoding/json"
++	"fmt"
++	"math"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestErrorRetryAfterJSON(t *testing.T) {
++	max := int64(math.MaxInt64) / int64(time.Second)
++	for _, tc := range []struct {
++		name, value string
++		want        bool
++	}{
++		{"omitted", "", false}, {"null", "null", false}, {"positive", "17", true},
++		{"maximum", fmt.Sprint(max), true}, {"zero", "0", false}, {"negative", "-1", false},
++		{"duration_overflow", fmt.Sprint(max + 1), false}, {"integer_overflow", "9223372036854775808", false},
++		{"string", `"17"`, false}, {"float", "17.0", false}, {"fraction", "1.5", false},
++		{"bool", "true", false}, {"object", "{}", false}, {"array", "[]", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			raw := `{"code":"quota","message":"exhausted","http_status":429`
++			if tc.value != "" {
++				raw += `,"retry_after_seconds":` + tc.value
++			}
++			raw += "}"
++			var e Error
++			if err := json.Unmarshal([]byte(raw), &e); err != nil {
++				t.Fatalf("optional metadata broke decoding: %v", err)
++			}
++			if e.HTTPStatus != 429 || e.Message != "exhausted" {
++				t.Fatalf("lost status/message: %+v", e)
++			}
++			out, err := json.Marshal(e)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := strings.Contains(string(out), `"retry_after_seconds":`); got != tc.want {
++				t.Fatalf("metadata presence = %t, want %t: %s", got, tc.want, out)
++			}
++			if tc.want && !strings.Contains(string(out), `"retry_after_seconds":`+tc.value) {
++				t.Fatalf("delay changed: %s", out)
++			}
++		})
++	}
++}
++
++func TestErrorRetryAfterPointerEncodingAndReuse(t *testing.T) {
++	seconds := int64(17)
++	e := Error{Code: "quota", Message: "exhausted", HTTPStatus: 429, RetryAfterSeconds: &seconds}
++	raw, err := json.Marshal(e)
++	if err != nil || !strings.Contains(string(raw), `"retry_after_seconds":17`) {
++		t.Fatalf("optional pointer encoding: %s %v", raw, err)
++	}
++	if err := json.Unmarshal([]byte(`{"code":"quota","message":"exhausted","http_status":429}`), &e); err != nil {
++		t.Fatal(err)
++	}
++	if e.RetryAfterSeconds != nil {
++		t.Fatal("omitted metadata retained old pointer")
++	}
++	for _, value := range []string{"null", `"17"`, "17.0", "0", "-1", "9223372037"} {
++		t.Run("reuse="+value, func(t *testing.T) {
++			e.RetryAfterSeconds = &seconds
++			raw := `{"http_status":429,"retry_after_seconds":` + value + `}`
++			if err := json.Unmarshal([]byte(raw), &e); err != nil {
++				t.Fatal(err)
++			}
++			if e.RetryAfterSeconds != nil || e.HTTPStatus != 429 {
++				t.Fatalf("invalid optional metadata retained pointer or lost status: %+v", e)
++			}
++		})
++	}
++	if err := json.Unmarshal([]byte(`{"http_status":"429","retry_after_seconds":"bad"}`), &e); err == nil {
++		t.Fatal("tolerant optional decoding must not weaken status decoding")
++	}
++	for _, raw := range []string{
++		`{"code":17,"retry_after_seconds":"bad"}`,
++		`{"message":true,"retry_after_seconds":"bad"}`,
++		`{"retryable":"true","retry_after_seconds":"bad"}`,
++	} {
++		if err := json.Unmarshal([]byte(raw), &e); err == nil {
++			t.Fatalf("existing fields must remain strict: %s", raw)
++		}
++	}
++}
+diff --git a/sdk/pluginabi/types.go b/sdk/pluginabi/types.go
+index 31800cc..857924f 100644
+--- a/sdk/pluginabi/types.go
++++ b/sdk/pluginabi/types.go
+@@ -125,6 +125,8 @@ type Error struct {
+ 	// HTTPStatus is the HTTP status code (e.g. 401, 403, 429) to surface to the client.
+ 	// When omitted or 0, CPA defaults to HTTP 500 (internal_server_error).
+ 	HTTPStatus int `json:"http_status,omitempty"`
++	// RetryAfterSeconds is an optional positive delay representable as a Go duration.
++	RetryAfterSeconds *int64 `json:"retry_after_seconds,omitempty"`
+ }
+ 
+ // Error implements the error interface for Error.

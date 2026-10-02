@@ -45,7 +45,7 @@ func validateRetryTestModuleDir(dir string) (string, error) {
 			break
 		}
 	}
-	if module != "github.com/router-for-me/CLIProxyAPI/v7" {
+	if module != "github.com/router-for-me/CLIProxyAPI/v7" && module != "github.com/router-for-me/CLIProxyAPI/v8" {
 		return "", fmt.Errorf("unexpected module declaration %q", module)
 	}
 	info, err = os.Stat(filepath.Join(root, "cmd", "server"))
@@ -53,6 +53,40 @@ func validateRetryTestModuleDir(dir string) (string, error) {
 		return "", fmt.Errorf("required cmd/server directory missing")
 	}
 	return root, nil
+}
+
+func retryTestModulePath(root string) (string, error) {
+	mod, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(mod), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "module" {
+			module := strings.Trim(fields[1], `"`)
+			if module == "github.com/router-for-me/CLIProxyAPI/v7" || module == "github.com/router-for-me/CLIProxyAPI/v8" {
+				return module, nil
+			}
+			return "", fmt.Errorf("unexpected module declaration %q", module)
+		}
+	}
+	return "", fmt.Errorf("module declaration missing")
+}
+
+func retryTestExpectHeader(module string) (bool, error) {
+	if value, set := os.LookupEnv("CPA_RETRY_TEST_EXPECT_HEADER"); set {
+		expect, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, fmt.Errorf("CPA_RETRY_TEST_EXPECT_HEADER must be a boolean: %w", err)
+		}
+		return expect, nil
+	}
+	_, override := os.LookupEnv("CPA_RETRY_TEST_MODULE_DIR")
+	if override && module == "github.com/router-for-me/CLIProxyAPI/v8" {
+		return false, fmt.Errorf("v8 override requires explicit CPA_RETRY_TEST_EXPECT_HEADER=true or false")
+	}
+	// Preserve legacy v7 patched-override compatibility and stock-v7 default.
+	return override, nil
 }
 
 func TestRetryTestModuleDirValidation(t *testing.T) {
@@ -64,6 +98,8 @@ func TestRetryTestModuleDirValidation(t *testing.T) {
 		{name: "wrong module", module: "example.test/wrong", server: true},
 		{name: "missing server", module: "github.com/router-for-me/CLIProxyAPI/v7"},
 		{name: "valid", module: "github.com/router-for-me/CLIProxyAPI/v7", server: true, valid: true},
+		{name: "valid v8", module: "github.com/router-for-me/CLIProxyAPI/v8", server: true, valid: true},
+		{name: "unsupported v9", module: "github.com/router-for-me/CLIProxyAPI/v9", server: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -124,7 +160,7 @@ func TestCLIProxyAPIProcessSchedulerRetry(t *testing.T) {
 					if bytes.Contains(body, []byte("retry_after_seconds=")) != knownReset {
 						t.Fatalf("legacy retry metadata must match reset reliability: known=%v body=%s", knownReset, body)
 					}
-					_, patched := os.LookupEnv("CPA_RETRY_TEST_MODULE_DIR")
+					patched := fixture.expectHeader
 					if !knownReset || !patched {
 						if len(response.Header.Values("Retry-After")) != 0 {
 							t.Fatalf("unexpected Retry-After=%q", response.Header.Values("Retry-After"))
@@ -151,16 +187,25 @@ func TestCLIProxyAPIProcessSchedulerRetry(t *testing.T) {
 }
 
 type schedulerRetryProcess struct {
-	baseURL   string
-	client    *http.Client
-	reset     time.Time
-	proxyHits *atomic.Int64
+	baseURL      string
+	client       *http.Client
+	reset        time.Time
+	proxyHits    *atomic.Int64
+	expectHeader bool
 }
 
 func startSchedulerRetryProcess(t *testing.T, knownReset bool) schedulerRetryProcess {
 	t.Helper()
 	// Resolve/build only the stock module unless an explicit validated override is supplied.
 	root, dir := cliProxyAPIModuleDir(t), t.TempDir()
+	module, err := retryTestModulePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectHeader, err := retryTestExpectHeader(module)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reset := time.Now().Add(90 * time.Second).UTC().Truncate(time.Second)
 	resetJSON := "null"
 	if knownReset {
@@ -202,7 +247,7 @@ func startSchedulerRetryProcess(t *testing.T, knownReset bool) schedulerRetryPro
 	serverPath := filepath.Join(dir, serverName)
 	// The stock host starts an unrelated metadata updater even in local-model
 	// mode. Redirect its string endpoint at link time, without modifying source.
-	cmd = exec.Command("go", "build", "-ldflags", "-X=github.com/router-for-me/CLIProxyAPI/v7/internal/misc.antigravityHubLatestManifestURL="+usage.URL+"/metadata", "-o", serverPath, "./cmd/server")
+	cmd = exec.Command("go", "build", "-ldflags", "-X="+module+"/internal/misc.antigravityHubLatestManifestURL="+usage.URL+"/metadata", "-o", serverPath, "./cmd/server")
 	cmd.Dir = root
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build CPA: %v\n%s", err, out)
@@ -264,5 +309,45 @@ func startSchedulerRetryProcess(t *testing.T, knownReset bool) schedulerRetryPro
 		return a && b
 	})
 	waitForProcessModel(t, client, baseURL, done, &processErr, logPath, e2eProtectedModel)
-	return schedulerRetryProcess{baseURL: baseURL, client: client, reset: reset, proxyHits: hits}
+	return schedulerRetryProcess{baseURL: baseURL, client: client, reset: reset, proxyHits: hits, expectHeader: expectHeader}
+}
+
+func TestRetryTestHeaderExpectation(t *testing.T) {
+	const v7 = "github.com/router-for-me/CLIProxyAPI/v7"
+	const v8 = "github.com/router-for-me/CLIProxyAPI/v8"
+	for _, tc := range []struct {
+		name, module, value            string
+		override, explicit, want, fail bool
+	}{
+		{name: "stock v7", module: v7},
+		{name: "legacy patched v7", module: v7, override: true, want: true},
+		{name: "v8 requires expectation", module: v8, override: true, fail: true},
+		{name: "stock v8", module: v8, override: true, explicit: true, value: "false"},
+		{name: "patched v8", module: v8, override: true, explicit: true, value: "true", want: true},
+		{name: "invalid expectation", module: v8, override: true, explicit: true, value: "invalid", fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range []string{"CPA_RETRY_TEST_MODULE_DIR", "CPA_RETRY_TEST_EXPECT_HEADER"} {
+				old, set := os.LookupEnv(key)
+				t.Cleanup(func() {
+					if set {
+						_ = os.Setenv(key, old)
+					} else {
+						_ = os.Unsetenv(key)
+					}
+				})
+				_ = os.Unsetenv(key)
+			}
+			if tc.override {
+				t.Setenv("CPA_RETRY_TEST_MODULE_DIR", "synthetic")
+			}
+			if tc.explicit {
+				t.Setenv("CPA_RETRY_TEST_EXPECT_HEADER", tc.value)
+			}
+			got, err := retryTestExpectHeader(tc.module)
+			if (err != nil) != tc.fail || got != tc.want {
+				t.Fatalf("got=%v err=%v want=%v fail=%v", got, err, tc.want, tc.fail)
+			}
+		})
+	}
 }
