@@ -206,12 +206,15 @@ func startSchedulerRetryProcess(t *testing.T, knownReset bool) schedulerRetryPro
 	if err != nil {
 		t.Fatal(err)
 	}
-	reset := time.Now().Add(90 * time.Second).UTC().Truncate(time.Second)
-	resetJSON := "null"
-	if knownReset {
-		resetJSON = strconv.Quote(reset.Format(time.RFC3339))
-	}
+	// Compilation under architecture emulation can outlast the quota window.
+	// Publish the epoch only after builds; handlers load it atomically.
+	var resetEpoch atomic.Int64
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reset := time.Unix(resetEpoch.Load(), 0).UTC()
+		resetJSON := "null"
+		if knownReset {
+			resetJSON = strconv.Quote(reset.Format(time.RFC3339))
+		}
 		percent, recovery := 20, strconv.Quote(reset.Format(time.RFC3339))
 		switch r.Header.Get("Authorization") {
 		case "Bearer retry-token-a":
@@ -272,6 +275,8 @@ func startSchedulerRetryProcess(t *testing.T, knownReset bool) schedulerRetryPro
 	server.Dir, server.Stdout, server.Stderr = root, log, log
 	// Also confine background host metadata clients to the rejecting local proxy.
 	server.Env = append(os.Environ(), "HOME="+filepath.Join(dir, "home"), "HTTP_PROXY="+proxy.URL, "HTTPS_PROXY="+proxy.URL, "ALL_PROXY="+proxy.URL, "NO_PROXY=127.0.0.1,localhost")
+	reset := time.Now().Add(90 * time.Second).UTC().Truncate(time.Second)
+	resetEpoch.Store(reset.Unix())
 	if err := server.Start(); err != nil {
 		log.Close()
 		t.Fatal(err)
