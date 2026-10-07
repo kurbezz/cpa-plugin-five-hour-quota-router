@@ -13,7 +13,10 @@ import urllib.error
 import urllib.request
 
 MODEL = "claude-opus-4-1-20250805"
-state = {"reset": "", "known": True, "proxy_hits": 0}
+state = {"reset": "", "known": True, "proxy_hits": 0, "background_hits": []}
+# CPA >= v8.0.20 refreshes the Grok CLI version from npm through proxy-url at
+# startup regardless of -local-model. It is metadata, not provider traffic.
+BACKGROUND_TARGETS = {("CONNECT", "registry.npmjs.org:443")}
 
 
 class Fixture(http.server.BaseHTTPRequestHandler):
@@ -29,6 +32,9 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(body)
+        elif (self.command, self.path) in BACKGROUND_TARGETS:
+            state["background_hits"].append(f"{self.command} {self.path}")
+            self.send_error(502)
         else:
             state["proxy_hits"] += 1
             self.send_error(502)
@@ -49,7 +55,7 @@ def request(url, payload=None, management=False):
 
 
 def run_case(known):
-    state.update(known=known, reset=datetime.datetime.fromtimestamp(math.floor(time.time()) + 90, datetime.timezone.utc).isoformat().replace("+00:00", "Z"), proxy_hits=0)
+    state.update(known=known, reset=datetime.datetime.fromtimestamp(math.floor(time.time()) + 90, datetime.timezone.utc).isoformat().replace("+00:00", "Z"), proxy_hits=0, background_hits=[])
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
         auth = root / "auth"
@@ -115,7 +121,7 @@ plugins:
                         else:
                             assert not values, values
                         assert state["proxy_hits"] == 0, state
-                        print(json.dumps({"known_reset": known, "stream": stream, "status": response.status, "retry_after": values, "content_type": response.headers.get_content_type(), "proxy_hits": 0, "healthy_a": True, "blocked_priority_b": True}), flush=True)
+                        print(json.dumps({"known_reset": known, "stream": stream, "status": response.status, "retry_after": values, "content_type": response.headers.get_content_type(), "proxy_hits": 0, "background_hits": sorted(set(state["background_hits"])), "healthy_a": True, "blocked_priority_b": True}), flush=True)
             finally:
                 process.terminate()
                 try:

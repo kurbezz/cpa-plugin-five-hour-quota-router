@@ -1,7 +1,7 @@
 # Patched CPA image (Linux/amd64)
 
-Builds CPA v8.0.2 from exact public revision
-`4a2c81864f31f39308e946c4c65e72147855da6e` plus the checksum-checked reviewed patch.
+Builds CPA v8.0.20 from exact public revision
+`0f96f568e4dbf6f84ad7399a74b78344c5eac7e6` plus the checksum-checked reviewed patch.
 Go 1.26 bookworm and Debian bookworm base images are digest pinned. Server CGO is
 enabled for native plugin loading. Runtime has upstream `/CLIProxyAPI` layout,
 `./CLIProxyAPI` command, port 8317 and Asia/Shanghai timezone. No plugin, production
@@ -42,7 +42,7 @@ Dedicated `cpa-image.yml` validates PRs without package-write permission. Only
 master push or manual dispatch on master in the designated repository may publish.
 Publish job receives package-write permission, authenticates with GITHUB_TOKEN,
 and loads/pushes the same image tar validated by the read-only job; it does not
-rebuild. Tags are `cpa-8.0.2-retry-after` and `sha-<full repository commit>`, never
+rebuild. Tags are `cpa-8.0.20-retry-after` and `sha-<full repository commit>`, never
 `latest`. SHA tags are a naming convention, not registry-enforced immutability;
 use the reported digest for deployment. Concurrent publish runs are serialized.
 

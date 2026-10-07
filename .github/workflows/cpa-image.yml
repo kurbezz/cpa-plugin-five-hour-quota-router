@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
   push:
     branches: [master]
-    paths: ['docker/**', '.github/workflows/cpa-image.yml', 'docs/patches/cpa-v8.0.2-scheduler-retry-after.patch', '*.go', 'go.mod', 'go.sum']
+    paths: ['docker/**', '.github/workflows/cpa-image.yml', 'docs/patches/cpa-v8.0.20-scheduler-retry-after.patch', '*.go', 'go.mod', 'go.sum']
   pull_request:
-    paths: ['docker/**', '.github/workflows/cpa-image.yml', 'docs/patches/cpa-v8.0.2-scheduler-retry-after.patch', '*.go', 'go.mod', 'go.sum']
+    paths: ['docker/**', '.github/workflows/cpa-image.yml', 'docs/patches/cpa-v8.0.20-scheduler-retry-after.patch', '*.go', 'go.mod', 'go.sum']
 permissions:
   contents: read
 concurrency:
@@ -59,9 +59,9 @@ jobs:
         run: |
           image=ghcr.io/kurbezz/cpa-plugin-five-hour-quota-router
           docker tag cpa-candidate "$image:sha-$GITHUB_SHA"
-          docker tag cpa-candidate "$image:cpa-8.0.2-retry-after"
+          docker tag cpa-candidate "$image:cpa-8.0.20-retry-after"
           docker push "$image:sha-$GITHUB_SHA"
-          docker push "$image:cpa-8.0.2-retry-after"
+          docker push "$image:cpa-8.0.20-retry-after"
           digest=$(docker image inspect "$image:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
           echo "Validated Linux/amd64 CPA image: \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Anonymous digest pull and package visibility still require independent verification." >> "$GITHUB_STEP_SUMMARY"
