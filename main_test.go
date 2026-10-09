@@ -2481,7 +2481,7 @@ func TestManagementStatusRouteExposesOnlySchedulerState(t *testing.T) {
 	allowedKeys := map[string]bool{
 		"id": true, "auth_index": true, "name": true, "known": true, "blocked": true,
 		"five_hour_percent_used": true, "sampled_at": true, "reset_at": true, "last_error_category": true,
-		"windows": true,
+		"windows": true, "last_refresh_error": true, "consecutive_failures": true, "next_refresh_at": true,
 	}
 	for _, rawAccount := range rawAccounts {
 		account, okAccount := rawAccount.(map[string]any)

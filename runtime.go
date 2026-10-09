@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
@@ -232,12 +233,14 @@ type pluginRuntime struct {
 	host                hostClient
 	fetch               usageFetcher
 	now                 func() time.Time
-	wake                chan struct{}
-	cancel              context.CancelFunc
-	done                chan struct{}
-	pendingAll          bool
-	pendingIDs          map[string]struct{}
-	pendingRevisionIDs  map[string]struct{}
+	// jitter returns extra delay added to a refresh pause; nil means none.
+	jitter             func(time.Duration) time.Duration
+	wake               chan struct{}
+	cancel             context.CancelFunc
+	done               chan struct{}
+	pendingAll         bool
+	pendingIDs         map[string]struct{}
+	pendingRevisionIDs map[string]struct{}
 	// deferredRevisionIDs is owned as lifecycle state under refreshMu. Delayed
 	// revision retries are promoted by refreshLoop's timer, never by detached
 	// goroutines, so an old runtime cannot enqueue into a restarted one.
@@ -401,10 +404,11 @@ func newPluginRuntime(host hostClient, fetch usageFetcher, now func() time.Time)
 		now = time.Now
 	}
 	runtime := &pluginRuntime{
-		cache: quotaCache{samples: make(map[string]quotaSample)},
-		host:  host,
-		fetch: fetch,
-		now:   now,
+		cache:  quotaCache{samples: make(map[string]quotaSample)},
+		host:   host,
+		fetch:  fetch,
+		now:    now,
+		jitter: defaultRefreshJitter,
 	}
 	cfg := defaultPluginConfig()
 	runtime.config.Store(&cfg)
@@ -821,6 +825,11 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 	if !current {
 		return
 	}
+	// A paused auth skips even the local credential read unless a revision
+	// check needs it; recordUsageAttempt is the authoritative gate below.
+	if !revisionCheck && !revisionIntent && r.cache.refreshPaused(auth.ID, pollStartedAt) {
+		return
+	}
 	rawAuth, err := r.host.getAuth(auth.AuthIndex)
 	if err != nil {
 		r.recordPollFailure(auth, pollErrorAuthGet)
@@ -860,10 +869,11 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 	if !r.cache.recordAttemptForIdentity(auth, r.now()) {
 		return
 	}
+	priorFailures := r.cache.snapshot(auth.ID).RefreshFailures
 	result, category := r.fetch(ctx, token, cfg.RequestTimeout)
 	if category != "" {
 		if category != pollErrorCancelled || ctx.Err() == nil {
-			r.recordPollFailure(auth, category)
+			r.recordRefreshFailure(auth, incarnation, category, result.Failure)
 		}
 		return
 	}
@@ -871,7 +881,14 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 	if !batch.FiveHour.Valid {
 		batch.FiveHour = quotaWindow{Percent: result.FiveHourPercentUsed, ResetAt: result.ResetAt, Source: quotaSourceUsage, Valid: true}
 	}
-	if !r.cache.commitWindowBatch(auth, generation, incarnation, batch, r.now(), pollStartedAt, true) {
+	committed := r.cache.commitWindowBatch(auth, generation, incarnation, batch, r.now(), pollStartedAt, true)
+	if priorFailures > 0 && r.cache.snapshot(auth.ID).RefreshFailures == 0 {
+		r.log("info", "five-hour quota router quota refresh recovered", map[string]any{
+			"auth_id":              auth.ID,
+			"consecutive_failures": priorFailures,
+		})
+	}
+	if !committed {
 		return
 	}
 	r.log("debug", "five-hour quota router quota refreshed", map[string]any{
@@ -898,10 +915,46 @@ func (r *pluginRuntime) recordPollFailure(auth physicalClaudeAuth, category stri
 	if !r.cache.recordFailureForIdentity(auth, category) {
 		return
 	}
-	r.log("warn", "five-hour quota router quota refresh failed", map[string]any{
+	r.log("warn", "five-hour quota router quota refresh failed ("+category+")", map[string]any{
 		"auth_id":  auth.ID,
 		"category": category,
 	})
+}
+
+// recordRefreshFailure handles a failed upstream usage fetch: it pauses every
+// refresh path for this auth (see quotaCache.recordRefreshFailure) and logs
+// exactly one line for this attempt. CPA's log formatter prints only a fixed
+// set of field keys, so the essentials are also carried in the message text.
+func (r *pluginRuntime) recordRefreshFailure(auth physicalClaudeAuth, incarnation uint64, category string, failure usageFailure) {
+	failures, nextAt, ok := r.cache.recordRefreshFailure(auth, incarnation, category, failure, r.now(), r.jitter)
+	if !ok {
+		return
+	}
+	detail := describeRefreshFailure(category, failure)
+	next := nextAt.UTC().Format(time.RFC3339)
+	fields := map[string]any{
+		"auth_id":              auth.ID,
+		"category":             category,
+		"consecutive_failures": failures,
+		"next_refresh_at":      next,
+		// Not "error": CPA prints that key, duplicating the message text.
+		"refresh_error": detail,
+	}
+	if failure.StatusCode != 0 {
+		fields["status"] = failure.StatusCode
+	}
+	if failure.HasRetryAfter {
+		fields["upstream_retry_after_seconds"] = int64(failure.RetryAfter.Round(time.Second) / time.Second)
+	}
+	r.log("warn", fmt.Sprintf("five-hour quota router quota refresh failed (%s; failure #%d; next attempt at %s)", detail, failures, next), fields)
+}
+
+func defaultRefreshJitter(delay time.Duration) time.Duration {
+	limit := int64(delay / refreshBackoffJitterFraction)
+	if limit <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(limit + 1))
 }
 
 func (r *pluginRuntime) log(level, message string, fields map[string]any) {

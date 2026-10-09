@@ -34,6 +34,7 @@ func TestWindowRefreshFailedUsageThrottled(t *testing.T) {
 		calls.Add(1)
 		return usageResult{}, pollErrorNetwork
 	}, clock.now)
+	r.jitter = nil
 	cfg := defaultPluginConfig()
 	cfg.PollInterval = time.Minute
 	auth := physicalClaudeAuths(host.entries)[0]
@@ -50,7 +51,14 @@ func TestWindowRefreshFailedUsageThrottled(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("failed usage fetch retried before interval: calls=%d", calls.Load())
 	}
+	// A failed fetch now pauses this auth for the refresh backoff, which is
+	// longer than poll-interval.
 	clock.set(now.Add(time.Minute))
+	r.pollAuthWithRevisionIntent(context.Background(), auth, cfg, true, true)
+	if calls.Load() != 1 {
+		t.Fatalf("failed usage fetch retried during backoff: calls=%d", calls.Load())
+	}
+	clock.set(now.Add(refreshBackoffBase))
 	r.pollAuthWithRevisionIntent(context.Background(), auth, cfg, true, true)
 	if calls.Load() != 2 {
 		t.Fatalf("eligible retry calls=%d, want 2", calls.Load())

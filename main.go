@@ -28,6 +28,14 @@ const (
 	pollErrorServer           = "server_error"
 	pollErrorHTTP             = "http_error"
 	pollErrorRead             = "read_error"
+
+	// Per-auth pause after a failed usage refresh. Without upstream retry
+	// hints the pause is base * 2^(n-1) capped at max; a 429 never waits less
+	// than base. Upstream hints are honored up to refreshBackoffHeaderMax.
+	refreshBackoffBase           = 5 * time.Minute
+	refreshBackoffMax            = 30 * time.Minute
+	refreshBackoffHeaderMax      = 6 * time.Hour
+	refreshBackoffJitterFraction = 10 // jitter is in [0, delay/10]
 )
 
 var pluginVersion = "0.1.0"

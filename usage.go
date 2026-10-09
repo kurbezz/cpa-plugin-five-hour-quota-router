@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,7 +18,26 @@ type usageResult struct {
 	FiveHourPercentUsed float64
 	ResetAt             time.Time
 	Windows             quotaWindowBatch
+	// Failure carries safe, bounded diagnostics for a failed fetch. It is
+	// populated only alongside a non-empty error category.
+	Failure usageFailure
 }
+
+// usageFailure describes a failed usage fetch without retaining the token or
+// the raw response body. Message is at most maxUpstreamErrorMessageLen runes
+// and comes only from a JSON error.message field (or the HTTP status text).
+type usageFailure struct {
+	StatusCode    int
+	Message       string
+	RetryAfter    time.Duration
+	HasRetryAfter bool
+}
+
+const (
+	maxUpstreamErrorBodyBytes  = 4 << 10
+	maxUpstreamErrorMessageLen = 160
+)
+
 type usageFetcher func(context.Context, string, time.Duration) (usageResult, string)
 type httpUsageFetcher struct {
 	client              *http.Client
@@ -65,39 +85,122 @@ func (f httpUsageFetcher) fetch(ctx context.Context, token string, timeout time.
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		failure := usageFailure{StatusCode: resp.StatusCode, Message: upstreamErrorMessage(resp)}
+		failure.RetryAfter, failure.HasRetryAfter = upstreamRetryDelay(resp.Header, time.Now())
+		failed := usageResult{Failure: failure}
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
-			return usageResult{}, pollErrorUnauthorized
+			return failed, pollErrorUnauthorized
 		case http.StatusForbidden:
-			return usageResult{}, pollErrorForbidden
+			return failed, pollErrorForbidden
 		case http.StatusTooManyRequests:
-			return usageResult{}, pollErrorRateLimited
+			return failed, pollErrorRateLimited
 		default:
 			if resp.StatusCode >= 500 {
-				return usageResult{}, pollErrorServer
+				return failed, pollErrorServer
 			}
-			return usageResult{}, pollErrorHTTP
+			return failed, pollErrorHTTP
 		}
 	}
+	okFailure := usageResult{Failure: usageFailure{StatusCode: resp.StatusCode}}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUsageResponseBytes+1))
 	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled):
-			return usageResult{}, pollErrorCancelled
+			return okFailure, pollErrorCancelled
 		case errors.Is(err, context.DeadlineExceeded):
-			return usageResult{}, pollErrorTimeout
+			return okFailure, pollErrorTimeout
 		default:
-			return usageResult{}, pollErrorRead
+			return okFailure, pollErrorRead
 		}
 	}
 	if len(body) > maxUsageResponseBytes {
-		return usageResult{}, pollErrorBodyTooLarge
+		return okFailure, pollErrorBodyTooLarge
 	}
 	var payload map[string]json.RawMessage
 	if json.Unmarshal(body, &payload) != nil {
-		return usageResult{}, pollErrorInvalidJSON
+		return okFailure, pollErrorInvalidJSON
 	}
-	return parseUsageWindows(payload)
+	result, category := parseUsageWindows(payload)
+	if category != "" {
+		return okFailure, category
+	}
+	return result, ""
+}
+
+// upstreamErrorMessage extracts only Anthropic's JSON error.message from a
+// bounded error body. Any other body is never echoed: the HTTP status text is
+// used instead, so arbitrary upstream content cannot reach logs or status.
+func upstreamErrorMessage(resp *http.Response) string {
+	fallback := http.StatusText(resp.StatusCode)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return fallback
+	}
+	message := sanitizeUpstreamMessage(payload.Error.Message)
+	if message == "" {
+		return fallback
+	}
+	return message
+}
+
+func sanitizeUpstreamMessage(raw string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range strings.TrimSpace(raw) {
+		if n >= maxUpstreamErrorMessageLen {
+			b.WriteString("...")
+			break
+		}
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// upstreamRetryDelay reads Retry-After (delta seconds or HTTP-date) first and
+// otherwise the earliest future anthropic-ratelimit-*-reset header (unix
+// seconds or RFC3339).
+func upstreamRetryDelay(header http.Header, now time.Time) (time.Duration, bool) {
+	if raw := strings.TrimSpace(header.Get("Retry-After")); raw != "" {
+		if seconds, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) && seconds >= 0 {
+			if seconds > refreshBackoffHeaderMax.Seconds() {
+				return refreshBackoffHeaderMax, true
+			}
+			return time.Duration(seconds * float64(time.Second)), true
+		}
+		if at, err := http.ParseTime(raw); err == nil {
+			delay := at.Sub(now)
+			if delay < 0 {
+				delay = 0
+			}
+			return delay, true
+		}
+	}
+	var earliest time.Duration
+	found := false
+	for name, values := range header {
+		lower := strings.ToLower(name)
+		if !strings.HasPrefix(lower, "anthropic-ratelimit-") || !strings.HasSuffix(lower, "-reset") || len(values) == 0 {
+			continue
+		}
+		at, ok := parseClaudeHeaderResetTime(strings.TrimSpace(values[0]))
+		if !ok || !at.After(now) {
+			continue
+		}
+		if delay := at.Sub(now); !found || delay < earliest {
+			earliest, found = delay, true
+		}
+	}
+	return earliest, found
 }
 
 type usageLimitEntry struct {

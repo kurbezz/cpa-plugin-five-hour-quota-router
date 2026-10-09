@@ -59,7 +59,7 @@ CI validation, publication, and anonymous digest pull as three separate gates.
 
 ## User-owned deployment
 
-Keep installed v0.5.1 plugin and existing config/auth/plugin bind mounts. Persist
+Keep installed v0.5.2 plugin and existing config/auth/plugin bind mounts. Persist
 the digest image reference in Dokploy's authoritative raw/Git compose source;
 do not edit regenerated host compose files. Retain old exact image digest for
 rollback. Do not replace the mounted config inode or enable overage. No deployment

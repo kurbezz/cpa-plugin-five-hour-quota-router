@@ -32,7 +32,7 @@ FROM builder AS test-plugin
 WORKDIR /plugin
 COPY go.mod go.sum ./
 COPY *.go ./
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags="-s -w -X main.pluginVersion=0.5.1 -X main.usageEndpoint=http://127.0.0.1:19091/usage" -o /out/five-hour-quota-router.so .
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags="-s -w -X main.pluginVersion=0.5.2 -X main.usageEndpoint=http://127.0.0.1:19091/usage" -o /out/five-hour-quota-router.so .
 
 FROM runtime AS verify
 RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*

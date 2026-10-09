@@ -26,6 +26,9 @@ type cutoffAccountStatus struct {
 	SampledAt           string              `json:"sampled_at,omitempty"`
 	ResetAt             string              `json:"reset_at,omitempty"`
 	LastErrorCategory   string              `json:"last_error_category,omitempty"`
+	LastRefreshError    string              `json:"last_refresh_error,omitempty"`
+	ConsecutiveFailures int                 `json:"consecutive_failures"`
+	NextRefreshAt       string              `json:"next_refresh_at,omitempty"`
 	Windows             []quotaWindowStatus `json:"windows,omitempty"`
 }
 
@@ -65,6 +68,95 @@ type quotaSample struct {
 	Windows             quotaWindowBatch
 	UsageAttemptAt      time.Time
 	UsageSuccessAt      time.Time
+	// Per-auth refresh pause after failed upstream usage fetches. While now is
+	// before NextRefreshAt no path may fetch usage for this auth; routing keeps
+	// using the last successful windows. A successful poll clears all three.
+	RefreshFailures  int
+	NextRefreshAt    time.Time
+	LastRefreshError string
+}
+
+func (s quotaSample) refreshPaused(now time.Time) bool {
+	return !s.NextRefreshAt.IsZero() && now.Before(s.NextRefreshAt)
+}
+
+func clearRefreshBackoff(sample *quotaSample) {
+	sample.RefreshFailures = 0
+	sample.NextRefreshAt = time.Time{}
+	sample.LastRefreshError = ""
+}
+
+// refreshBackoffDelay returns the pause after the failures-th consecutive
+// failed usage fetch. An upstream Retry-After/ratelimit reset hint wins over
+// the exponential schedule; a 429 never pauses for less than the base.
+func refreshBackoffDelay(failures int, category string, failure usageFailure) time.Duration {
+	delay := refreshBackoffBase
+	for i := 1; i < failures && delay < refreshBackoffMax; i++ {
+		delay *= 2
+	}
+	if delay > refreshBackoffMax {
+		delay = refreshBackoffMax
+	}
+	if failure.HasRetryAfter {
+		delay = failure.RetryAfter
+		if delay > refreshBackoffHeaderMax {
+			delay = refreshBackoffHeaderMax
+		}
+	}
+	rateLimited := category == pollErrorRateLimited || failure.StatusCode == 429
+	if rateLimited && delay < refreshBackoffBase {
+		delay = refreshBackoffBase
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	return delay
+}
+
+func describeRefreshFailure(category string, failure usageFailure) string {
+	text := category
+	if failure.StatusCode != 0 {
+		text = fmt.Sprintf("%s: HTTP %d", text, failure.StatusCode)
+	}
+	if failure.Message != "" {
+		text += ": " + failure.Message
+	}
+	return text
+}
+
+// recordRefreshFailure records a failed upstream usage fetch for the same
+// credential incarnation that started it and schedules the next allowed
+// attempt. It never touches the last successful quota windows.
+func (c *quotaCache) recordRefreshFailure(auth physicalClaudeAuth, incarnation uint64, category string, failure usageFailure, now time.Time, jitter func(time.Duration) time.Duration) (int, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sample, ok := c.samples[auth.ID]
+	if !ok || !sampleMatchesAuth(sample, auth) || sample.Incarnation != incarnation {
+		return 0, time.Time{}, false
+	}
+	sample.RefreshFailures++
+	delay := refreshBackoffDelay(sample.RefreshFailures, category, failure)
+	if jitter != nil && delay > 0 {
+		if extra := jitter(delay); extra > 0 {
+			delay += extra
+		}
+	}
+	// Jitter only lengthens a pause; without an upstream hint the computed
+	// schedule never exceeds the configured maximum.
+	if !failure.HasRetryAfter && delay > refreshBackoffMax {
+		delay = refreshBackoffMax
+	}
+	sample.NextRefreshAt = now.Add(delay)
+	sample.LastRefreshError = describeRefreshFailure(category, failure)
+	sample.LastErrorCategory = category
+	c.samples[auth.ID] = sample
+	return sample.RefreshFailures, sample.NextRefreshAt, true
+}
+
+func (c *quotaCache) refreshPaused(authID string, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.samples[authID].refreshPaused(now)
 }
 
 // confirmedFleetExhaustedReset atomically verifies exhaustion for and returns
@@ -212,6 +304,11 @@ func (c *quotaCache) recordUsageAttempt(auth physicalClaudeAuth, generation, inc
 	if !ok || !sampleMatchesAuth(s, auth) || s.ObservedGeneration != generation || s.Incarnation != incarnation {
 		return false
 	}
+	// Final, atomic gate for every refresh path (startup/reload fleet pass,
+	// request-driven candidate refresh, revision checks).
+	if s.refreshPaused(at) {
+		return false
+	}
 	s.UsageAttemptAt = at
 	s.LastAttemptAt = at
 	c.samples[auth.ID] = s
@@ -255,6 +352,9 @@ func (c *quotaCache) commitWindowBatch(auth physicalClaudeAuth, generation, inca
 	}
 	if isPoll && (sample.UsageSuccessAt.IsZero() || sampledAt.After(sample.UsageSuccessAt)) {
 		sample.UsageSuccessAt = sampledAt
+	}
+	if isPoll {
+		clearRefreshBackoff(&sample)
 	}
 	c.samples[auth.ID] = sample
 	return changed
@@ -456,7 +556,7 @@ func latestUsageTime(sample quotaSample) time.Time {
 }
 
 func usageRefreshDueSample(sample quotaSample, now time.Time, cutoff float64, minimumAge time.Duration) bool {
-	if refreshSuppressed(sample, now, cutoff) {
+	if refreshSuppressed(sample, now, cutoff) || sample.refreshPaused(now) {
 		return false
 	}
 	last := latestUsageTime(sample)
@@ -545,7 +645,15 @@ func (c *quotaCache) bindRevisionForIncarnation(auth physicalClaudeAuth, revisio
 	}
 	if sample.Revision != "" && sample.Revision != revision {
 		c.nextIncarnation++
+		previous := sample
 		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration, Incarnation: c.nextIncarnation}
+		// A token rotation of the same physical account keeps its refresh
+		// pause: upstream rate limiting is per account, not per token. Only a
+		// pause caused by a rejected (401) token is lifted by a new token.
+		if previous.LastErrorCategory != pollErrorUnauthorized {
+			sample.RefreshFailures, sample.NextRefreshAt, sample.LastRefreshError = previous.RefreshFailures, previous.NextRefreshAt, previous.LastRefreshError
+			sample.LastErrorCategory = previous.LastErrorCategory
+		}
 	}
 	sample.Revision = revision
 	c.samples[auth.ID] = sample
@@ -731,12 +839,19 @@ func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStat
 	for authID, sample := range c.samples {
 		known := sample.known(now)
 		account := cutoffAccountStatus{
-			ID:                authID,
-			AuthIndex:         sample.AuthIndex,
-			Name:              sample.Name,
-			Known:             known,
-			Blocked:           sample.excluded(now, cutoff),
-			LastErrorCategory: sample.LastErrorCategory,
+			ID:                  authID,
+			AuthIndex:           sample.AuthIndex,
+			Name:                sample.Name,
+			Known:               known,
+			Blocked:             sample.excluded(now, cutoff),
+			LastErrorCategory:   sample.LastErrorCategory,
+			LastRefreshError:    sample.LastRefreshError,
+			ConsecutiveFailures: sample.RefreshFailures,
+		}
+		// next_refresh_at is reported only while the pause is active: an
+		// elapsed pause no longer restricts refresh.
+		if sample.refreshPaused(now) {
+			account.NextRefreshAt = sample.NextRefreshAt.UTC().Format(time.RFC3339)
 		}
 		account.Windows = quotaWindowStatuses(sampleQuotaWindows(sample), now, cutoff)
 		if known {
