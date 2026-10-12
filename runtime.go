@@ -178,12 +178,21 @@ func (r *pluginRuntime) observeResponseHeaders(model, requestID string, headers 
 		return
 	}
 	batch := parseClaudeQuotaHeaders(headers, model, observedAt, r.loadedConfig().CutoffPercentUsed)
-	if !batch.FiveHour.Valid && !batch.Weekly.Valid && !batch.FableWeekly.Valid && !batch.OpusWeekly.Valid && !batch.SonnetWeekly.Valid {
+	extra, hasExtra := parseClaudeOverageHeaders(headers, observedAt)
+	hasWindows := batch.FiveHour.Valid || batch.Weekly.Valid || batch.FableWeekly.Valid || batch.OpusWeekly.Valid || batch.SonnetWeekly.Valid
+	if !hasWindows && !hasExtra {
 		r.consumeSelectedAuth(requestID, correlation)
 		return
 	}
+	committed := false
+	if hasExtra && r.cache.commitExtraUsage(correlation.authID, correlation.generation, correlation.incarnation, extra, observedAt, false) {
+		committed = true
+	}
 	auth := physicalClaudeAuth{ID: correlation.authID}
-	if !r.cache.commitWindowBatch(auth, correlation.generation, correlation.incarnation, batch, observedAt, time.Time{}, false) {
+	if hasWindows && r.cache.commitWindowBatch(auth, correlation.generation, correlation.incarnation, batch, observedAt, time.Time{}, false) {
+		committed = true
+	}
+	if !committed {
 		return
 	}
 	r.consumeSelectedAuth(requestID, correlation)
@@ -882,6 +891,9 @@ func (r *pluginRuntime) pollAuthWithRevisionIntent(ctx context.Context, auth phy
 		batch.FiveHour = quotaWindow{Percent: result.FiveHourPercentUsed, ResetAt: result.ResetAt, Source: quotaSourceUsage, Valid: true}
 	}
 	committed := r.cache.commitWindowBatch(auth, generation, incarnation, batch, r.now(), pollStartedAt, true)
+	if result.HasExtra {
+		r.cache.commitExtraUsage(auth.ID, generation, incarnation, result.Extra, r.now(), true)
+	}
 	if priorFailures > 0 && r.cache.snapshot(auth.ID).RefreshFailures == 0 {
 		r.log("info", "five-hour quota router quota refresh recovered", map[string]any{
 			"auth_id":              auth.ID,

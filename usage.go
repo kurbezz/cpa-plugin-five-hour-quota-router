@@ -18,6 +18,9 @@ type usageResult struct {
 	FiveHourPercentUsed float64
 	ResetAt             time.Time
 	Windows             quotaWindowBatch
+	// Extra is the optional display-only extra_usage object.
+	Extra    extraUsage
+	HasExtra bool
 	// Failure carries safe, bounded diagnostics for a failed fetch. It is
 	// populated only alongside a non-empty error category.
 	Failure usageFailure
@@ -317,6 +320,7 @@ func parseUsageWindows(root map[string]json.RawMessage) (usageResult, string) {
 	out.Windows = batch
 	out.FiveHourPercentUsed = batch.FiveHour.Percent
 	out.ResetAt = batch.FiveHour.ResetAt
+	out.Extra, out.HasExtra = parseUsageExtra(root["extra_usage"])
 	return out, ""
 }
 func parseUsageWindowValue(percentRaw, resetRaw json.RawMessage) (quotaWindow, bool) {

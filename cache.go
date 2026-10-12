@@ -30,6 +30,7 @@ type cutoffAccountStatus struct {
 	ConsecutiveFailures int                 `json:"consecutive_failures"`
 	NextRefreshAt       string              `json:"next_refresh_at,omitempty"`
 	Windows             []quotaWindowStatus `json:"windows,omitempty"`
+	ExtraUsage          *extraUsageStatus   `json:"extra_usage,omitempty"`
 }
 
 type quotaWindowStatus struct {
@@ -74,6 +75,8 @@ type quotaSample struct {
 	RefreshFailures  int
 	NextRefreshAt    time.Time
 	LastRefreshError string
+	// Extra is display-only paid overage state; routing never reads it.
+	Extra extraUsage
 }
 
 func (s quotaSample) refreshPaused(now time.Time) bool {
@@ -646,7 +649,8 @@ func (c *quotaCache) bindRevisionForIncarnation(auth physicalClaudeAuth, revisio
 	if sample.Revision != "" && sample.Revision != revision {
 		c.nextIncarnation++
 		previous := sample
-		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration, Incarnation: c.nextIncarnation}
+		// Extra usage is billed per account, so a token rotation keeps it.
+		sample = quotaSample{AuthIndex: auth.AuthIndex, Name: auth.Name, Identity: auth.Identity, ListRevision: sample.ListRevision, LastRevisionCheckAt: sample.LastRevisionCheckAt, RevisionCheckAttemptAt: sample.RevisionCheckAttemptAt, ObservedGeneration: sample.ObservedGeneration, Incarnation: c.nextIncarnation, Extra: previous.Extra}
 		// A token rotation of the same physical account keeps its refresh
 		// pause: upstream rate limiting is per account, not per token. Only a
 		// pause caused by a rejected (401) token is lifted by a new token.
@@ -854,6 +858,7 @@ func (c *quotaCache) statuses(now time.Time, cutoff float64) []cutoffAccountStat
 			account.NextRefreshAt = sample.NextRefreshAt.UTC().Format(time.RFC3339)
 		}
 		account.Windows = quotaWindowStatuses(sampleQuotaWindows(sample), now, cutoff)
+		account.ExtraUsage = extraUsageStatusFor(sample.Extra)
 		if known {
 			percentUsed := sample.FiveHourPercentUsed
 			account.FiveHourPercentUsed = &percentUsed
