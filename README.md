@@ -21,11 +21,33 @@ plugins:
       request-timeout: 10s
       # user-agent: claude-code/2.1.80        # optional override, see "User-Agent" below
       overage-fallback-enabled: true          # optional; see "Overage fallback" below (default: true)
+      # quota-api-keys: [change-me]            # optional; enables the /quota resource route (default: empty = 404)
 ```
 
 The library basename must be `five-hour-quota-router` with `.dylib`, `.so`, or `.dll` for the host platform.
 
 `poll-interval` is the minimum cached-usage age before another refresh, not a continuous polling timer. Default: `60s`.
+
+## Quota resource route (`quota-api-keys`)
+
+`GET /v0/resource/plugins/five-hour-quota-router/quota` returns Claude and Codex quotas without the CPA management key. It is protected by plugin-owned keys: set `quota-api-keys` (list of strings) and send `Authorization: Bearer <key>`. With no keys configured the route returns 404; a missing or wrong key returns 401 `{"error":"unauthorized"}`.
+
+```json
+{
+  "claude": { "enabled": true, "cutoff_percent_used": 95, "protected_models": [], "accounts": [] },
+  "codex": [
+    {
+      "auth_index": "abc123", "email": "a@example.com", "label": "main",
+      "usage": { "...": "raw wham/usage body" },
+      "error": "rate_limited: HTTP 429: Too Many Requests",
+      "retry_after_ms": 300000,
+      "fetched_at": "2026-10-30T12:00:00Z"
+    }
+  ]
+}
+```
+
+`claude` is identical to the management status route. `codex` lists enabled Codex auths, fetched on demand from `chatgpt.com/backend-api/wham/usage` and cached for 60s. On failure the last good `usage` is kept alongside `error`, and that auth is paused with the same 5m→30m backoff as Claude refreshes (honoring `Retry-After`).
 
 ## Behavior
 

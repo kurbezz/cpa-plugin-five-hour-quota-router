@@ -26,6 +26,7 @@ type rawPluginConfig struct {
 	RequestTimeout         string    `yaml:"request-timeout"`
 	UserAgent              string    `yaml:"user-agent"`
 	OverageFallbackEnabled *bool     `yaml:"overage-fallback-enabled"`
+	QuotaAPIKeys           []string  `yaml:"quota-api-keys"`
 }
 
 type pluginConfig struct {
@@ -36,6 +37,7 @@ type pluginConfig struct {
 	RequestTimeout         time.Duration
 	UserAgent              string
 	OverageFallbackEnabled bool
+	QuotaAPIKeys           []string
 }
 
 type registration struct {
@@ -53,7 +55,12 @@ type registrationCapabilities struct {
 }
 
 type managementRegistrationResponse struct {
-	Routes []managementRoute `json:"routes"`
+	Routes    []managementRoute  `json:"routes"`
+	Resources []resourceRouteDef `json:"resources,omitempty"`
+}
+
+type resourceRouteDef struct {
+	Path string `json:"path"`
 }
 
 type managementRoute struct {
@@ -121,6 +128,11 @@ func decodeLifecycleConfig(raw []byte) (pluginConfig, error) {
 	if decoded.OverageFallbackEnabled != nil {
 		cfg.OverageFallbackEnabled = *decoded.OverageFallbackEnabled
 	}
+	for _, key := range decoded.QuotaAPIKeys {
+		if key = strings.TrimSpace(key); key != "" {
+			cfg.QuotaAPIKeys = append(cfg.QuotaAPIKeys, key)
+		}
+	}
 	if math.IsNaN(cfg.CutoffPercentUsed) || math.IsInf(cfg.CutoffPercentUsed, 0) || cfg.CutoffPercentUsed < 0 || cfg.CutoffPercentUsed > 100 {
 		return pluginConfig{}, fmt.Errorf("cutoff-percent-used must be between 0 and 100")
 	}
@@ -158,7 +170,7 @@ func managementRegistration() managementRegistrationResponse {
 	return managementRegistrationResponse{Routes: []managementRoute{{
 		Method: http.MethodGet,
 		Path:   managementStatusRoute,
-	}}}
+	}}, Resources: []resourceRouteDef{{Path: quotaResourceRoute}}}
 }
 
 func pluginRegistration() registration {
@@ -194,6 +206,11 @@ func pluginRegistration() registration {
 					Name:        "user-agent",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "User-Agent sent with requests to Anthropic's undocumented /api/oauth/usage endpoint. That endpoint's rate-limit bucketing is keyed by User-Agent, and requests not matching Claude Code's own client string are aggressively and persistently throttled. Default: claude-code/2.1.80. Requires a plugin process restart to take effect.",
+				},
+				{
+					Name:        "quota-api-keys",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "API keys accepted as 'Authorization: Bearer <key>' by GET /v0/resource/plugins/five-hour-quota-router/quota, which returns Claude and Codex quotas without the CPA management key. Default: empty, which disables the route (404).",
 				},
 				{
 					Name:        "overage-fallback-enabled",

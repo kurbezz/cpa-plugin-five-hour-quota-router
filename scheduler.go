@@ -210,6 +210,9 @@ func isProtectedModel(model string, protectedModels []string) bool {
 }
 
 func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	if strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) && strings.TrimRight(strings.TrimSpace(req.Path), "/") == quotaResourceFullPath {
+		return r.handleQuotaResource(req)
+	}
 	if !strings.EqualFold(strings.TrimSpace(req.Method), http.MethodGet) || strings.TrimRight(strings.TrimSpace(req.Path), "/") != managementStatusFullPath {
 		body, _ := json.Marshal(map[string]string{"error": "not found"})
 		return pluginapi.ManagementResponse{
@@ -219,12 +222,7 @@ func (r *pluginRuntime) handleManagement(req pluginapi.ManagementRequest) plugin
 		}
 	}
 	cfg := r.loadedConfig()
-	body, _ := json.Marshal(cutoffStatusResponse{
-		Enabled:           cfg.Enabled,
-		CutoffPercentUsed: cfg.CutoffPercentUsed,
-		ProtectedModels:   cfg.ProtectedModels,
-		Accounts:          r.cache.statuses(r.now(), cfg.CutoffPercentUsed),
-	})
+	body := r.statusBody(cfg)
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
 		Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},

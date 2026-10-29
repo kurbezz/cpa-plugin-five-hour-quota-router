@@ -239,6 +239,7 @@ type pluginRuntime struct {
 	discoveryReconciled uint64
 	config              atomic.Pointer[pluginConfig]
 	cache               quotaCache
+	codex               codexStates
 	host                hostClient
 	fetch               usageFetcher
 	now                 func() time.Time
